@@ -1,0 +1,25 @@
+# Route Resilience — Virtual environments & caches
+.venv/
+venv/
+cache/
+__pycache__/
+*.pyc
+.env
+*.log
+.DS_Store
+Thumbs.db
+wandb/
+mlruns/
+.ipynb_checkpoints/
+
+# Large training models and raw tiles
+data/raw/
+data/tiles/
+data/models/
+*.pth
+*.pt
+*.pkl
+*.gpickle
+*.zip
+*.tar.gz
+.streamlit/secrets.toml

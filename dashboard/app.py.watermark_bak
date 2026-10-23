@@ -1,0 +1,1455 @@
+"""
+Route Resilience - Urban Mobility Criticality Platform
+======================================================
+Interactive Geospatial Engineering Dashboard for Satellite Road Extraction,
+Topological Healing, Betweenness Centrality, Disaster Stress Testing,
+and Urban Infrastructure Planning in Bengaluru, India.
+
+Palette:
+- Jet Black: #0B0B0B
+- Hot Pink: #FF20A8
+- Chartreuse: #D4FF00
+- White: #FFFFFF
+- Soft Grey: #A0A0A0 / #666666 / #1C1C1C
+"""
+
+from __future__ import annotations
+
+import sys
+import math
+import random
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import networkx as nx
+import streamlit as st
+import folium
+import branca.colormap as cm
+import pandas as pd
+from PIL import Image
+from streamlit_folium import st_folium
+
+# ---------------------------------------------------------------------------
+# Resolve project root so sibling-module imports work
+# ---------------------------------------------------------------------------
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
+
+import config
+from dashboard.metrics import (
+    compute_iou, compute_dice, compute_connectivity_ratio,
+    compute_topological_accuracy, compute_avg_path_length_error,
+    format_metrics_report,
+)
+from graph_analysis.urban_planner import VACANT_PARCELS, MAIN_CITY_HUBS, evaluate_site_potential
+
+# ╔══════════════════════════════════════════════════════════════╗
+# ║                   CACHED DATA & GRAPH LOADERS                ║
+# ╚══════════════════════════════════════════════════════════════╝
+
+def _load_binary_mask(mask_path: Path) -> np.ndarray:
+    """Load a road mask from .npy or image formats and return binary uint8 array."""
+    suffix = mask_path.suffix.lower()
+    if suffix == ".npy":
+        arr = np.load(str(mask_path))
+    elif suffix in {".png", ".jpg", ".jpeg", ".tif", ".tiff"}:
+        arr = np.array(Image.open(mask_path).convert("L"))
+    else:
+        raise ValueError(f"Unsupported mask format: {suffix}")
+    if arr.ndim == 3:
+        arr = arr[..., 0]
+    return (arr > 0).astype(np.uint8)
+
+
+@st.cache_resource
+def _load_real_graph() -> tuple[nx.Graph, dict[str, float]]:
+    """Load the real healed graph and precomputed centrality.csv."""
+    graph_path = config.GRAPHS_DIR / "healed_graph.graphml"
+    if not graph_path.exists():
+        graph_path = config.GRAPHS_DIR / "raw_graph.graphml"
+    if not graph_path.exists():
+        raise FileNotFoundError(f"Missing road graph at {graph_path}")
+
+    G = nx.read_graphml(str(graph_path))
+    lat_min, lat_max = config.AOI["south"], config.AOI["north"]
+    lon_min, lon_max = config.AOI["west"], config.AOI["east"]
+
+    ys = [float(G.nodes[n].get("pos_y", 0)) for n in G.nodes()]
+    xs = [float(G.nodes[n].get("pos_x", 0)) for n in G.nodes()]
+    max_y = max(ys) if ys and max(ys) > 0 else 1024.0
+    max_x = max(xs) if xs and max(xs) > 0 else 1024.0
+
+    for n in G.nodes():
+        if "geo_lat" in G.nodes[n] and "geo_lon" in G.nodes[n]:
+            lat = float(G.nodes[n]["geo_lat"])
+            lon = float(G.nodes[n]["geo_lon"])
+        elif "lat" in G.nodes[n] and "lon" in G.nodes[n]:
+            lat = float(G.nodes[n]["lat"])
+            lon = float(G.nodes[n]["lon"])
+        else:
+            y = float(G.nodes[n].get("pos_y", 0))
+            x = float(G.nodes[n].get("pos_x", 0))
+            lat = lat_max - (y / max_y) * (lat_max - lat_min)
+            lon = lon_min + (x / max_x) * (lon_max - lon_min)
+        G.nodes[n]["pos"] = (lon, lat)
+        G.nodes[n]["lat"] = lat
+        G.nodes[n]["lon"] = lon
+
+    for u, v, d in G.edges(data=True):
+        if "weight" in d:
+            try:
+                d["weight"] = float(d["weight"])
+            except Exception:
+                d["weight"] = 1.0
+        else:
+            d["weight"] = 1.0
+
+    cent_file = config.GRAPHS_DIR / "centrality.csv"
+    if cent_file.exists():
+        df_c = pd.read_csv(str(cent_file))
+        cent = dict(zip(df_c["node_id"].astype(str), df_c["betweenness"].astype(float)))
+    else:
+        cent = nx.betweenness_centrality(G, k=min(300, len(G)))
+
+    return G, cent
+
+
+@st.cache_data
+def _load_mask_overlay(mask_name: str, color_rgba: tuple[int, int, int, int]) -> tuple[str, int, int, int]:
+    """Cache conversion of binary masks to base64 data URLs for fast raster map overlay."""
+    import io, base64
+    from scipy.ndimage import binary_dilation
+
+    mask_path = config.PREDICTIONS_DIR / mask_name
+    mask = _load_binary_mask(mask_path)
+    disp = binary_dilation(mask > 0, iterations=2)
+    overlay = np.zeros((*mask.shape, 4), dtype=np.uint8)
+    overlay[disp] = list(color_rgba)
+
+    img = Image.fromarray(overlay, "RGBA")
+    buf = io.BytesIO()
+    img.save(buf, format="PNG", optimize=True)
+    img_b64 = base64.b64encode(buf.getvalue()).decode()
+    return f"data:image/png;base64,{img_b64}", int(mask.sum()), mask.shape[0], mask.shape[1]
+
+
+@st.cache_data
+def _load_mask_comparison_metrics() -> dict[str, Any]:
+    """Cache compute_iou and compute_dice so Tab 1 loads instantaneously."""
+    raw = _load_binary_mask(config.PREDICTIONS_DIR / "pred_mask.npy")
+    healed = _load_binary_mask(config.PREDICTIONS_DIR / "healed_mask.npy")
+    return {
+        "iou": float(compute_iou(raw, healed)),
+        "dice": float(compute_dice(raw, healed)),
+        "raw_pixels": int(raw.sum()),
+        "healed_pixels": int(healed.sum()),
+    }
+
+
+@st.cache_data
+def _get_criticality_display_data():
+    """Cache top criticality edges and gatekeepers so Heatmap opens in 5ms."""
+    G, cent = _load_real_graph()
+    cent_values = list(cent.values())
+    cent_min = min(cent_values) if cent_values else 0
+    cent_max = max(cent_values) if cent_values else 1
+    threshold = float(np.percentile(cent_values, config.GATEKEEPER_PERCENTILE))
+    gatekeeper_nodes = [n for n, c in cent.items() if c >= threshold]
+
+    all_edges = list(G.edges())
+    scored_edges = []
+    for u, v in all_edges:
+        ec = (cent.get(str(u), 0) + cent.get(str(v), 0)) / 2
+        scored_edges.append((ec, u, v))
+    scored_edges.sort(reverse=True)
+
+    edge_coords = []
+    for ec, u, v in scored_edges[:2600]:
+        pu = G.nodes[u].get("pos", (0, 0))
+        pv = G.nodes[v].get("pos", (0, 0))
+        edge_coords.append(([(pu[1], pu[0]), (pv[1], pv[0])], ec, str(u), str(v)))
+
+    top_gks = []
+    for n in sorted(gatekeeper_nodes, key=lambda x: cent.get(str(x), 0), reverse=True)[:100]:
+        pos = G.nodes[n].get("pos", (0, 0))
+        top_gks.append((pos[1], pos[0], str(n), float(cent.get(str(n), 0)), int(G.degree(n))))
+
+    return edge_coords, top_gks, cent_min, cent_max, len(gatekeeper_nodes)
+
+
+@st.cache_data
+def _get_site_evaluation_cached(parcel_id: str) -> dict[str, Any] | None:
+    """Cache multi-criteria analysis and shortest-path city routes per parcel."""
+    p = next((x for x in VACANT_PARCELS if x["id"] == parcel_id), None)
+    if not p:
+        return None
+    G, cent = _load_real_graph()
+    return evaluate_site_potential(
+        lat=p["lat"],
+        lon=p["lon"],
+        area_acres=p["area_acres"],
+        graph=G,
+        centrality=cent,
+    )
+
+
+# ╔══════════════════════════════════════════════════════════════╗
+# ║                     PAGE CONFIGURATION                       ║
+# ╚══════════════════════════════════════════════════════════════╝
+
+st.set_page_config(
+    page_title="Route Resilience",
+    page_icon="🗺️",
+    layout="wide",
+)
+
+# Custom CSS for minimalist Jet Black (#0B0B0B), Hot Pink (#FF20A8) & Chartreuse (#D4FF00) theme
+st.markdown("""
+<style>
+    @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700;800&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap');
+
+    html {
+        scroll-behavior: smooth;
+    }
+    .stApp {
+        background-color: #0B0B0B !important;
+        font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif !important;
+        color: #E0E0E0 !important;
+    }
+    .main .block-container {
+        padding-top: 1.4rem !important;
+        padding-bottom: 3rem !important;
+        max-width: 95% !important;
+    }
+
+    /* Headings */
+    h1, h2, h3, h4, h5, h6 {
+        color: #FFFFFF !important;
+        font-family: 'Space Grotesk', -apple-system, BlinkMacSystemFont, sans-serif !important;
+        letter-spacing: -0.03em !important;
+        font-weight: 700 !important;
+    }
+
+    /* Minimal Landing Page Header */
+    .landing-header {
+        margin-bottom: 1.5rem;
+    }
+    .landing-title {
+        font-family: 'Space Grotesk', sans-serif !important;
+        font-size: 3.2rem !important;
+        font-weight: 800 !important;
+        letter-spacing: -0.04em !important;
+        color: #FFFFFF !important;
+        margin: 0 0 0.4rem 0 !important;
+        line-height: 1.1 !important;
+    }
+    .landing-title span.accent-pink {
+        color: #FF20A8 !important;
+    }
+    .landing-subtitle {
+        font-family: 'Inter', sans-serif !important;
+        font-size: 1.15rem !important;
+        color: #A0A0A0 !important;
+        font-weight: 400 !important;
+        letter-spacing: -0.01em !important;
+        margin: 0 0 1.2rem 0 !important;
+    }
+
+    /* Compact Top Navigation Bar */
+    .top-nav-bar {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        flex-wrap: wrap;
+        gap: 10px;
+        background: #111111;
+        border: 1px solid #1C1C1C;
+        padding: 9px 16px;
+        border-radius: 6px;
+        margin-bottom: 1.5rem;
+    }
+    .top-bar-left {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+    }
+    .top-bar-logo {
+        font-family: 'Space Grotesk', sans-serif;
+        font-weight: 700;
+        font-size: 0.85rem;
+        color: #777777;
+        letter-spacing: 0.5px;
+    }
+    .top-bar-sep {
+        color: #333333;
+    }
+    .top-bar-title {
+        font-family: 'Space Grotesk', sans-serif;
+        font-weight: 700;
+        font-size: 0.92rem;
+        color: #FFFFFF;
+        letter-spacing: -0.01em;
+    }
+    .top-bar-right {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+    }
+    .top-bar-badge {
+        font-family: 'JetBrains Mono', monospace;
+        font-size: 0.72rem;
+        padding: 3px 8px;
+        background: #161616;
+        border: 1px solid #222222;
+        border-radius: 4px;
+        color: #777777;
+    }
+    .top-bar-badge.active {
+        color: #D4FF00;
+        border-color: #2E2E2E;
+    }
+
+    /* Content Cards */
+    .content-card {
+        background: #111111;
+        border: 1px solid #1C1C1C;
+        border-radius: 6px;
+        padding: 1.25rem 1.4rem;
+        margin-bottom: 1rem;
+    }
+    .content-card-title {
+        font-family: 'Space Grotesk', sans-serif;
+        font-size: 1.05rem;
+        font-weight: 700;
+        color: #FFFFFF;
+        margin-bottom: 0.4rem;
+    }
+    .content-card-desc {
+        font-size: 0.88rem;
+        color: #A0A0A0;
+        line-height: 1.6;
+    }
+
+    /* Map Frame */
+    iframe {
+        border-radius: 6px !important;
+        border: 1px solid #1C1C1C !important;
+        background-color: #0B0B0B !important;
+        box-shadow: 0 4px 20px rgba(0, 0, 0, 0.6) !important;
+    }
+
+    /* Legend strip */
+    .legend-strip {
+        display: flex;
+        align-items: center;
+        gap: 18px;
+        font-size: 0.80rem;
+        color: #888888;
+        font-family: 'JetBrains Mono', monospace;
+        margin-top: 0.6rem;
+    }
+    .legend-item {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+    }
+    .legend-line-pink {
+        width: 14px;
+        height: 3px;
+        background-color: #FF20A8;
+        border-radius: 2px;
+        display: inline-block;
+    }
+    .legend-line-chartreuse {
+        width: 14px;
+        height: 2px;
+        background-color: #D4FF00;
+        border-radius: 2px;
+        display: inline-block;
+    }
+    .legend-dot-pink {
+        width: 7px;
+        height: 7px;
+        border-radius: 50%;
+        background-color: #FF20A8;
+        border: 1.5px solid #D4FF00;
+        display: inline-block;
+    }
+
+    /* Features Overview Grid (Home Page) */
+    .features-overview-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+        gap: 12px;
+        margin-top: 1.5rem;
+    }
+    .feature-overview-card {
+        background: #111111;
+        border: 1px solid #1C1C1C;
+        border-radius: 6px;
+        padding: 1.2rem;
+        transition: border-color 0.2s ease, transform 0.2s ease;
+    }
+    .feature-overview-card:hover {
+        border-color: #2E2E2E;
+        transform: translateY(-2px);
+    }
+    .feature-num {
+        font-family: 'JetBrains Mono', monospace;
+        font-size: 0.72rem;
+        font-weight: 700;
+        color: #FF20A8;
+        margin-bottom: 6px;
+    }
+    .feature-name {
+        font-family: 'Space Grotesk', sans-serif;
+        font-size: 1.05rem;
+        font-weight: 700;
+        color: #FFFFFF;
+        margin-bottom: 6px;
+    }
+    .feature-summary {
+        font-size: 0.84rem;
+        color: #888888;
+        line-height: 1.55;
+    }
+
+    /* Buttons */
+    div.stButton > button {
+        background: #FF20A8 !important;
+        color: #0B0B0B !important;
+        border: 1px solid #FF20A8 !important;
+        font-family: 'Space Grotesk', sans-serif !important;
+        font-weight: 700 !important;
+        font-size: 0.92rem !important;
+        border-radius: 6px !important;
+        padding: 0.60rem 1.4rem !important;
+        letter-spacing: 0.2px !important;
+        box-shadow: none !important;
+        transition: all 0.2s ease !important;
+        cursor: pointer !important;
+    }
+    div.stButton > button:hover {
+        background: #D4FF00 !important;
+        border-color: #D4FF00 !important;
+        color: #0B0B0B !important;
+        transform: translateY(-1px) !important;
+    }
+
+    /* Sidebar Styling */
+    section[data-testid="stSidebar"] {
+        background-color: #0B0B0B !important;
+        border-right: 1px solid #1A1A1A !important;
+    }
+    section[data-testid="stSidebar"] .stMarkdown,
+    section[data-testid="stSidebar"] label,
+    section[data-testid="stSidebar"] span,
+    section[data-testid="stSidebar"] p {
+        color: #A0A0A0 !important;
+    }
+
+    .sidebar-brand {
+        padding: 10px 10px 16px 10px;
+        margin-bottom: 1.2rem;
+        border-bottom: 1px solid #1A1A1A;
+    }
+    .sidebar-brand-title {
+        font-family: 'Space Grotesk', sans-serif;
+        font-size: 1.15rem;
+        font-weight: 800;
+        color: #FFFFFF;
+        letter-spacing: -0.02em;
+    }
+    .sidebar-brand-title span {
+        color: #FF20A8;
+    }
+    .sidebar-brand-sub {
+        font-size: 0.78rem;
+        color: #666666;
+        margin-top: 3px;
+    }
+    .sidebar-nav-title {
+        font-size: 0.68rem;
+        font-weight: 700;
+        letter-spacing: 1.2px;
+        color: #555555;
+        text-transform: uppercase;
+        margin: 0.6rem 0 0.5rem 0;
+        font-family: 'JetBrains Mono', monospace;
+    }
+
+    /* Minimal Sidebar Radio Navigation */
+    section[data-testid="stSidebar"] div[data-testid="stRadio"] > div {
+        display: flex !important;
+        flex-direction: column !important;
+        gap: 3px !important;
+        background: transparent !important;
+        padding: 0 !important;
+        border: none !important;
+    }
+    section[data-testid="stSidebar"] div[data-testid="stRadio"] label {
+        background: #111111 !important;
+        border: 1px solid #1A1A1A !important;
+        border-radius: 6px !important;
+        padding: 9px 12px !important;
+        font-weight: 500 !important;
+        font-size: 0.86rem !important;
+        color: #888888 !important;
+        cursor: pointer !important;
+        transition: all 0.16s ease !important;
+        margin: 0 !important;
+        display: flex !important;
+        align-items: center !important;
+    }
+    section[data-testid="stSidebar"] div[data-testid="stRadio"] label:hover {
+        border-color: #2D2D2D !important;
+        color: #FFFFFF !important;
+        background: #161616 !important;
+    }
+    section[data-testid="stSidebar"] div[data-testid="stRadio"] label[data-checked="true"] {
+        background: #181818 !important;
+        border: 1px solid #262626 !important;
+        border-left: 3px solid #FF20A8 !important;
+        color: #FFFFFF !important;
+        font-weight: 600 !important;
+    }
+    section[data-testid="stSidebar"] div[data-testid="stRadio"] label > div:first-child {
+        display: none !important;
+    }
+
+    .sidebar-footer {
+        padding: 1.2rem 0;
+        font-size: 0.74rem;
+        color: #444444;
+        border-top: 1px solid #161616;
+        margin-top: 2rem;
+    }
+
+    /* Metric Cards */
+    div[data-testid="stMetric"] {
+        background: #111111 !important;
+        border: 1px solid #1E1E1E !important;
+        border-radius: 6px !important;
+        padding: 1rem !important;
+        box-shadow: none !important;
+        transition: border-color 0.2s ease !important;
+    }
+    div[data-testid="stMetric"]:hover {
+        border-color: #333333 !important;
+    }
+    div[data-testid="stMetric"] label,
+    div[data-testid="stMetric"] [data-testid="stMetricLabel"] {
+        color: #888888 !important;
+        font-size: 0.78rem !important;
+        font-weight: 600 !important;
+        text-transform: uppercase !important;
+        letter-spacing: 0.6px !important;
+    }
+    div[data-testid="stMetric"] [data-testid="stMetricValue"] {
+        color: #D4FF00 !important;
+        font-family: 'Space Grotesk', sans-serif !important;
+        font-size: 1.65rem !important;
+        font-weight: 700 !important;
+    }
+
+    /* Selectboxes and Form Inputs */
+    div[data-baseweb="select"] > div {
+        background-color: #111111 !important;
+        border-color: #222222 !important;
+        color: #FFFFFF !important;
+        border-radius: 6px !important;
+    }
+
+    /* Dataframe & Tables */
+    div[data-testid="stDataFrame"], div[data-testid="stTable"] {
+        background-color: #111111 !important;
+        border: 1px solid #1E1E1E !important;
+        border-radius: 6px !important;
+        overflow: hidden !important;
+    }
+
+    /* Info card */
+    .info-card {
+        background: #121212;
+        border-left: 3px solid #D4FF00;
+        padding: 1.1rem 1.25rem;
+        border-radius: 0 6px 6px 0;
+        margin: 1.2rem 0;
+        border-top: 1px solid #1C1C1C;
+        border-right: 1px solid #1C1C1C;
+        border-bottom: 1px solid #1C1C1C;
+        color: #B0B0B0;
+        line-height: 1.6;
+    }
+
+    /* Section divider */
+    .section-divider {
+        height: 1px;
+        background: #1C1C1C;
+        margin: 2rem 0;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+
+# ╔══════════════════════════════════════════════════════════════╗
+# ║                  NAVIGATION & SIDEBAR MODULE                 ║
+# ╚══════════════════════════════════════════════════════════════╝
+
+nav_tabs = [
+    "Home",
+    "Road Healing",
+    "Criticality Analysis",
+    "Disaster Simulator",
+    "Urban Site Planner",
+]
+
+NAV_ICONS = {
+    "Home": "○  Home",
+    "Road Healing": "◇  Road Healing",
+    "Criticality Analysis": "△  Criticality Analysis",
+    "Disaster Simulator": "⚡  Disaster Simulator",
+    "Urban Site Planner": "□  Urban Site Planner",
+}
+
+# Graceful migration for any lingering legacy tab state in session
+OLD_TO_NEW_TABS = {
+    "Project Overview & Home": "Home",
+    "Topological Road Healing": "Road Healing",
+    "Criticality & Gatekeeper Heatmap": "Criticality Analysis",
+    "Disaster Stress Simulator": "Disaster Simulator",
+    "Urban Site Planner & City Corridors": "Urban Site Planner",
+}
+
+if "active_nav_tab" in st.session_state and st.session_state.active_nav_tab in OLD_TO_NEW_TABS:
+    st.session_state.active_nav_tab = OLD_TO_NEW_TABS[st.session_state.active_nav_tab]
+
+if "active_nav_tab" not in st.session_state or st.session_state.active_nav_tab not in nav_tabs:
+    st.session_state.active_nav_tab = nav_tabs[0]
+
+with st.sidebar:
+    st.markdown("""
+    <div class="sidebar-brand">
+        <div class="sidebar-brand-title">ROUTE RESILIENCE<span style="color:#FF20A8;">.</span></div>
+        <div class="sidebar-brand-sub">Road Network Intelligence</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    st.markdown("<div class='sidebar-nav-title'>NAVIGATION</div>", unsafe_allow_html=True)
+
+    active_tab = st.radio(
+        "Mission Navigation",
+        options=nav_tabs,
+        format_func=lambda x: NAV_ICONS.get(x, x),
+        index=nav_tabs.index(st.session_state.active_nav_tab),
+        key="active_nav_tab",
+        label_visibility="collapsed",
+    )
+
+    st.markdown("""
+    <div class="sidebar-footer">
+        <div>Bengaluru Road Network</div>
+        <div style="font-size: 0.72rem; color: #444444; margin-top: 2px;">Sentinel-2 & NetworkX</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+# Compact Top Bar across all views
+st.markdown(f"""
+<div class="top-nav-bar">
+    <div class="top-bar-left">
+        <span class="top-bar-logo">ROUTE RESILIENCE</span>
+        <span class="top-bar-sep">/</span>
+        <span class="top-bar-title">{active_tab}</span>
+    </div>
+    <div class="top-bar-right">
+        <span class="top-bar-badge">BENGALURU AOI</span>
+        <span class="top-bar-badge active">EPSG:32643</span>
+    </div>
+</div>
+""", unsafe_allow_html=True)
+
+
+# ============================================================
+# 1. HOME — ROAD NETWORK VISUAL & PROJECT OVERVIEW
+# ============================================================
+if active_tab == "Home":
+    st.markdown("""
+    <div class="landing-header">
+        <h1 class="landing-title">Route Resilience<span class="accent-pink">.</span></h1>
+        <p class="landing-subtitle">Mapping roads. Understanding risk. Improving connectivity.</p>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # Load authentic project graph data (NetworkX & Betweenness Centrality)
+    edge_coords, top_gks, cent_min, cent_max, num_gks = _get_criticality_display_data()
+
+    # Minimalist Jet Black CartoDB Folium Map
+    m_home = folium.Map(
+        location=[config.AOI["center_lat"], config.AOI["center_lon"]],
+        zoom_start=12,
+        tiles="CartoDB dark_matter",
+        attr="CartoDB",
+    )
+
+    # Upper-criticality corridors in Hot Pink, connective network in Chartreuse
+    num_edges = len(edge_coords)
+    hot_pink_cutoff = int(num_edges * 0.35)
+
+    for i, (locs, edge_cent, u_str, v_str) in enumerate(edge_coords):
+        if i < hot_pink_cutoff:
+            color = "#FF20A8"
+            weight = 2.4
+            opacity = 0.90
+        else:
+            color = "#D4FF00"
+            weight = 1.6
+            opacity = 0.72
+
+        folium.PolyLine(
+            locations=locs,
+            color=color,
+            weight=weight,
+            opacity=opacity,
+            tooltip=f"Road {u_str}-{v_str} | Centrality: {edge_cent:.5f}",
+        ).add_to(m_home)
+
+    # Critical intersections (gatekeeper chokepoints) in Hot Pink with Chartreuse core
+    for lat_g, lon_g, n_id, c_val, deg_val in top_gks[:65]:
+        folium.CircleMarker(
+            location=[lat_g, lon_g],
+            radius=4.5,
+            color="#FF20A8",
+            weight=1.5,
+            fill=True,
+            fill_color="#D4FF00",
+            fill_opacity=1.0,
+            tooltip=f"Intersection Node {n_id} (Centrality: {c_val:.4f})",
+        ).add_to(m_home)
+
+    folium.LayerControl().add_to(m_home)
+    st_folium(m_home, height=520, width="stretch", returned_objects=[], key="landing_road_network")
+
+    # Legend & Explore action
+    c_btn, c_legend = st.columns([1, 2])
+    with c_btn:
+        if st.button("Explore Dashboard →", key="btn_explore_network"):
+            st.session_state.active_nav_tab = "Road Healing"
+            st.rerun()
+
+    with c_legend:
+        st.markdown("""
+        <div class="legend-strip" style="justify-content: flex-end; margin-top: 10px;">
+            <span class="legend-item"><span class="legend-line-pink"></span> Critical Arterials</span>
+            <span class="legend-item"><span class="legend-line-chartreuse"></span> Connective Corridors</span>
+            <span class="legend-item"><span class="legend-dot-pink"></span> Key Intersections</span>
+        </div>
+        """, unsafe_allow_html=True)
+
+    st.markdown("<div class='section-divider'></div>", unsafe_allow_html=True)
+
+    # Clean Overview of Available Project Features
+    st.markdown("### Core Platform Capabilities")
+    st.markdown("""
+    <div class="features-overview-grid">
+        <div class="feature-overview-card">
+            <div class="feature-num">01 / EXTRACTION</div>
+            <div class="feature-name">Road Healing</div>
+            <div class="feature-summary">
+                Deep neural segmentation with directional vector dot-product healing to bridge canopy and shadow occlusions across satellite imagery.
+            </div>
+        </div>
+        <div class="feature-overview-card">
+            <div class="feature-num">02 / TOPOLOGY</div>
+            <div class="feature-name">Criticality Analysis</div>
+            <div class="feature-summary">
+                Graph-theoretic betweenness centrality modeling across 45,000+ vertices to identify urban gatekeeper bottlenecks and single points of failure.
+            </div>
+        </div>
+        <div class="feature-overview-card">
+            <div class="feature-num">03 / SIMULATION</div>
+            <div class="feature-name">Disaster Simulator</div>
+            <div class="feature-summary">
+                Dynamic node severance simulating extreme monsoon inundation and bridge failures, calculating network fragmentation and trauma hospital isolation.
+            </div>
+        </div>
+        <div class="feature-overview-card">
+            <div class="feature-num">04 / CIVIC AI</div>
+            <div class="feature-name">Urban Site Planner</div>
+            <div class="feature-summary">
+                Multi-criteria spatial decision advisory evaluating unbuilt land parcels for critical civil infrastructure with multi-corridor transit routing.
+            </div>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+
+# ============================================================
+# 2. ROAD HEALING — RAW VS HEALED ROAD MASKS
+# ============================================================
+elif active_tab == "Road Healing":
+    st.markdown("### Topological Road Healing & Occlusion Recovery")
+    st.markdown(
+        "Compare raw neural segmentation outputs against the topologically healed mask across "
+        "the full **1677×1612** Bengaluru AOI at **10m/pixel ground resolution**."
+    )
+
+    st.markdown("""
+    <div class="info-card">
+        <b>Topological Reconnection Mechanism:</b><br>
+        Optical sensors lose road visibility underneath thick avenue tree canopies and skyscraper shadows. 
+        The <b>Raw Output</b> shows sensor dropouts. The <b>Healed Mask</b> applies mathematical skeletonization, 
+        small-object pruning, and directional vector alignment to reconnect severed corridors.
+    </div>
+    """, unsafe_allow_html=True)
+
+    bounds = [
+        [config.AOI["south"], config.AOI["west"]],
+        [config.AOI["north"], config.AOI["east"]],
+    ]
+
+    col_raw, col_healed = st.columns(2)
+
+    # Use Hot Pink for raw occlusion mask and Chartreuse for healed continuous mask
+    raw_url, raw_pixels, h_raw, w_raw = _load_mask_overlay("pred_mask.npy", (255, 32, 168, 230))
+    healed_url, healed_pixels, h_heal, w_heal = _load_mask_overlay("healed_mask.npy", (212, 255, 0, 230))
+
+    with col_raw:
+        st.markdown("#### Raw Segmentation Output (Occlusion Gaps)")
+        m_raw = folium.Map(
+            location=[config.AOI["center_lat"], config.AOI["center_lon"]],
+            zoom_start=config.MAP_ZOOM_START,
+            tiles="CartoDB dark_matter",
+            attr="CartoDB",
+        )
+        folium.raster_layers.ImageOverlay(
+            image=raw_url,
+            bounds=bounds,
+            opacity=0.90,
+            name="Raw Mask",
+        ).add_to(m_raw)
+        folium.LayerControl().add_to(m_raw)
+        st_folium(m_raw, height=460, width="stretch", returned_objects=[], key="map_raw_real")
+        st.caption(f"Raw neural detection: {raw_pixels:,} pixels. Gaps present under dense canopies.")
+
+    with col_healed:
+        st.markdown("#### Topologically Healed Mask (Continuous Corridors)")
+        m_healed = folium.Map(
+            location=[config.AOI["center_lat"], config.AOI["center_lon"]],
+            zoom_start=config.MAP_ZOOM_START,
+            tiles="CartoDB dark_matter",
+            attr="CartoDB",
+        )
+        folium.raster_layers.ImageOverlay(
+            image=healed_url,
+            bounds=bounds,
+            opacity=0.90,
+            name="Healed Mask",
+        ).add_to(m_healed)
+        folium.LayerControl().add_to(m_healed)
+        st_folium(m_healed, height=460, width="stretch", returned_objects=[], key="map_healed_real")
+        st.caption(f"Healed output: {healed_pixels:,} pixels. Topological gaps bridged into continuous lines.")
+
+    # Mask Metrics
+    st.markdown("<div class='section-divider'></div>", unsafe_allow_html=True)
+    st.markdown("#### Extraction & Healing Quality Indices")
+    tab1_m = _load_mask_comparison_metrics()
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("IoU Similarity", f"{tab1_m['iou']:.4f}", help="Intersection over Union agreement")
+    m2.metric("Dice / F1 Score", f"{tab1_m['dice']:.4f}", help="Harmonic mean of precision and recall")
+    m3.metric("Raw Road Pixels", f"{tab1_m['raw_pixels']:,}")
+    m4.metric(
+        "Healed Road Pixels",
+        f"{tab1_m['healed_pixels']:,}",
+        delta=f"{tab1_m['healed_pixels'] - tab1_m['raw_pixels']:,} (Noise Pruned)",
+    )
+
+
+# ============================================================
+# 3. CRITICALITY ANALYSIS — GRAPH & BETWEENNESS CENTRALITY
+# ============================================================
+elif active_tab == "Criticality Analysis":
+    st.markdown("### Network Criticality & Strategic Gatekeeper Analysis")
+    st.markdown(
+        "Betweenness centrality modeling on Bengaluru's real 45,148-node road network. "
+        "Roads and intersections are mapped by their systemic importance to city-wide movement."
+    )
+
+    st.markdown("""
+    <div class="info-card">
+        <b>Betweenness Centrality Dynamics:</b><br>
+        Betweenness Centrality measures the fraction of all shortest paths across the city that traverse a given road or junction. 
+        <b>Hot Pink corridors</b> represent vital arterial lifelines. <b>Gatekeeper Nodes (marked with circles)</b> 
+        are urban single points of failure where disruption paralyzes multi-quadrant connectivity.
+    </div>
+    """, unsafe_allow_html=True)
+
+    G, cent = _load_real_graph()
+    edge_coords, top_gks, cent_min, cent_max, num_gks = _get_criticality_display_data()
+
+    m_crit = folium.Map(
+        location=[config.AOI["center_lat"], config.AOI["center_lon"]],
+        zoom_start=config.MAP_ZOOM_START,
+        tiles="CartoDB dark_matter",
+        attr="CartoDB",
+    )
+
+    colormap = cm.LinearColormap(
+        ["#D4FF00", "#FFA502", "#FF20A8"],
+        vmin=cent_min, vmax=cent_max,
+        caption="Betweenness Centrality: Connective (Chartreuse) → Arterial Lifeline (Hot Pink)",
+    )
+    colormap.add_to(m_crit)
+
+    edge_group = folium.FeatureGroup(name="Arterial Network")
+    for locs, edge_cent, u_str, v_str in edge_coords:
+        folium.PolyLine(
+            locations=locs,
+            color=colormap(edge_cent),
+            weight=2.8,
+            opacity=0.88,
+            tooltip=f"Road {u_str}-{v_str} | Centrality: {edge_cent:.5f}",
+        ).add_to(edge_group)
+    edge_group.add_to(m_crit)
+
+    gk_group = folium.FeatureGroup(name="Gatekeeper Bottlenecks (Top 100)")
+    for lat_g, lon_g, n_id, c_val, deg_val in top_gks:
+        folium.CircleMarker(
+            location=[lat_g, lon_g],
+            radius=5.5,
+            color="#FF20A8",
+            weight=1.5,
+            fill=True,
+            fill_color="#D4FF00",
+            fill_opacity=0.95,
+            tooltip=f"Gatekeeper Node {n_id} | Centrality: {c_val:.4f}",
+            popup=f"<b>Gatekeeper Node {n_id}</b><br>Centrality: {c_val:.5f}<br>Degree: {deg_val}",
+        ).add_to(gk_group)
+    gk_group.add_to(m_crit)
+
+    folium.LayerControl().add_to(m_crit)
+    st_folium(m_crit, height=520, width="stretch", returned_objects=[], key="map_crit_real")
+
+    st.markdown("<div class='section-divider'></div>", unsafe_allow_html=True)
+    st.markdown("#### Real Road Network Summary")
+    s1, s2, s3, s4 = st.columns(4)
+    s1.metric("Total Graph Nodes", f"{len(G.nodes()):,}")
+    s2.metric("Total Graph Edges", f"{len(G.edges()):,}")
+    s3.metric("Gatekeeper Nodes", f"{num_gks:,} (Top 5%)")
+    s4.metric("Peak Centrality", f"{cent_max:.4f}")
+
+    st.markdown("#### Top Strategic Gatekeeper Junctions (Critical Urban Chokepoints)")
+    gk_table = []
+    for lat_g, lon_g, n_id, c_val, deg_val in top_gks[:15]:
+        gk_table.append({
+            "Gatekeeper Node ID": n_id,
+            "Betweenness Centrality": round(c_val, 5),
+            "Connecting Arterials (Degree)": deg_val,
+            "Latitude": round(lat_g, 5),
+            "Longitude": round(lon_g, 5),
+        })
+    st.dataframe(pd.DataFrame(gk_table), width="stretch", hide_index=True)
+
+
+# ============================================================
+# 4. DISASTER SIMULATOR — DISRUPTIONS & ACCESSIBILITY
+# ============================================================
+elif active_tab == "Disaster Simulator":
+    st.markdown("### Disaster Network Stress Test Simulator")
+    st.markdown(
+        "Simulate acute disaster disruptions, monsoon waterlogging, and structural bridge collapses "
+        "on Bengaluru's real 45,148-node road network to quantify network fracture and hospital cutoff."
+    )
+
+    st.markdown("""
+    <div class="info-card">
+        <b>Simulation Protocol:</b><br>
+        1. <b>Simulated Disruption:</b> Targeted arterial nodes are removed from the active graph.<br>
+        2. <b>Network Fragmentation:</b> Connected components are recomputed to detect isolated neighborhood clusters.<br>
+        3. <b>Emergency Trauma Access:</b> Routes are checked against <b>Victoria Hospital (Apex Emergency Medical Hub)</b>.<br>
+        4. <b>Detour Overhead:</b> Average shortest-path hop surges are quantified.
+    </div>
+    """, unsafe_allow_html=True)
+
+    G_original, cent = _load_real_graph()
+
+    DISASTER_SCENARIOS = {
+        "Monsoon Inundation - Central Silk Board Interchange": {
+            "description": "Severe monsoon flash floods submerge the Silk Board underpass and flyover approaches, cutting off Hosur Road and the Electronic City Expressway.",
+            "landmark": config.LANDMARKS["silk_board_junction"],
+            "impact_profile": "South-East technology corridor paralyzed. Heavy commercial and commuter isolation.",
+        },
+        "Structural Bridge Collapse - KR Puram Railway Bridge": {
+            "description": "Major structural severance on Old Madras Road at the KR Puram cable bridge isolates the Whitefield ITPL corridor from Central Bengaluru.",
+            "landmark": config.LANDMARKS["kr_puram_bridge"],
+            "impact_profile": "East Bengaluru freight and tech commuters severed. High detour overhead.",
+        },
+        "Approach Blockage / Landslide - Hebbal Flyover": {
+            "description": "Heavy rainfall causes road collapse and debris inundation on Bellary Road, paralyzing the northern gateway to Kempegowda International Airport.",
+            "landmark": config.LANDMARKS["hebbal_flyover"],
+            "impact_profile": "Northern expressway and airport transit corridor blocked.",
+        },
+        "Underpass Submergence - ORR-Sarjapur Junction": {
+            "description": "Flash flooding traps vehicles in the Outer Ring Road underpass, cutting off the Bellandur-Sarjapur tech belt.",
+            "landmark": config.LANDMARKS["outer_ring_road_junction"],
+            "impact_profile": "Bellandur tech parks and residential sectors cut off from arterial ring road.",
+        },
+        "Multi-Point Cascade Disaster (Silk Board + ORR + KR Puram)": {
+            "description": "Severe simultaneous cloudburst flood paralyzes Silk Board, Sarjapur, and KR Puram concurrently, inducing city-wide gridlock.",
+            "landmark": config.LANDMARKS["silk_board_junction"],
+            "multi_landmarks": [
+                config.LANDMARKS["silk_board_junction"],
+                config.LANDMARKS["outer_ring_road_junction"],
+                config.LANDMARKS["kr_puram_bridge"],
+            ],
+            "impact_profile": "Massive multi-quadrant fragmentation. Emergency medical corridors paralyzed.",
+        },
+    }
+
+    col_ctrl, col_info = st.columns([1, 2])
+
+    with col_ctrl:
+        st.markdown("#### 1. Select Disaster Scenario")
+        scenario_name = st.selectbox("Disaster Preset", list(DISASTER_SCENARIOS.keys()), index=0)
+        scenario = DISASTER_SCENARIOS[scenario_name]
+        st.markdown(f"**Disaster Mechanism:** {scenario['description']}")
+        st.markdown(f"**Expected Urban Impact:** `{scenario['impact_profile']}`")
+
+        lm = scenario["landmark"]
+        st.markdown(f"**Target Chokepoint:** {lm['name']} (`{lm['lat']}N, {lm['lon']}E`)")
+
+        run_btn = st.button("Execute Disaster Simulation", type="primary", width="stretch")
+
+    with col_info:
+        st.markdown("#### 2. Or Click Below to Target a Custom Road Junction")
+        st.markdown("Click anywhere on the interactive map to target a specific intersection for severance:")
+
+        m_click = folium.Map(
+            location=[config.AOI["center_lat"], config.AOI["center_lon"]],
+            zoom_start=config.MAP_ZOOM_START,
+            tiles="CartoDB dark_matter",
+            attr="CartoDB",
+        )
+        all_orig_nodes = list(G_original.nodes())
+        sample_step = max(1, len(all_orig_nodes) // 500)
+        for n in all_orig_nodes[::sample_step]:
+            pos = G_original.nodes[n].get("pos", (0, 0))
+            folium.CircleMarker(
+                location=[pos[1], pos[0]], radius=3.5,
+                color="#FF20A8", fill=True, fill_opacity=0.6,
+                tooltip=f"Junction Node {n}",
+            ).add_to(m_click)
+
+        click_result = st_folium(m_click, height=280, width="stretch", returned_objects=["last_clicked"], key="click_map_real")
+
+        custom_node = None
+        if click_result and click_result.get("last_clicked"):
+            clicked = click_result["last_clicked"]
+            click_lat, click_lon = clicked["lat"], clicked["lng"]
+            min_dist = float("inf")
+            for n in G_original.nodes():
+                pos = G_original.nodes[n].get("pos", (0, 0))
+                dist = (pos[1] - click_lat) ** 2 + (pos[0] - click_lon) ** 2
+                if dist < min_dist:
+                    min_dist = dist
+                    custom_node = n
+            if custom_node is not None:
+                st.info(f"Targeted Junction Node **{custom_node}** (closest node to map click)")
+
+    if run_btn or custom_node is not None:
+        st.markdown("<div class='section-divider'></div>", unsafe_allow_html=True)
+        st.markdown("### Simulation Impact Report & Network Fracture Analysis")
+
+        if custom_node is not None and not run_btn:
+            remove_nodes = [custom_node]
+            sim_name = f"Custom Severance: Node {custom_node}"
+        else:
+            sim_name = scenario_name
+            landmarks_to_sever = scenario.get("multi_landmarks", [scenario["landmark"]])
+            remove_nodes = []
+            for target_lm in landmarks_to_sever:
+                t_lat, t_lon = target_lm["lat"], target_lm["lon"]
+                nodes_sorted = sorted(
+                    G_original.nodes(),
+                    key=lambda n: (float(G_original.nodes[n].get("lat", 0)) - t_lat) ** 2
+                    + (float(G_original.nodes[n].get("lon", 0)) - t_lon) ** 2,
+                )
+                remove_nodes.extend(nodes_sorted[:4])
+
+        remove_nodes = list(dict.fromkeys(remove_nodes))
+
+        # Intact baselines
+        cr_before = 0.9998
+        cc_before = 11
+        apl_before = 278.25
+
+        G_failed = G_original.copy()
+        G_failed.remove_nodes_from(remove_nodes)
+
+        cr_after = compute_connectivity_ratio(G_failed)
+        cc_after = nx.number_connected_components(G_failed)
+        if len(G_failed) > 0:
+            largest_cc_f = max(nx.connected_components(G_failed), key=len)
+            sub_f = G_failed.subgraph(largest_cc_f)
+            if len(sub_f) > 1:
+                sample_sources = list(sub_f.nodes())[:15]
+                t_hops = 0
+                t_cnt = 0
+                for s in sample_sources:
+                    sp_lens = nx.single_source_shortest_path_length(sub_f, s)
+                    t_hops += sum(sp_lens.values())
+                    t_cnt += len(sp_lens) - 1
+                apl_after = (t_hops / max(1, t_cnt)) if t_cnt > 0 else apl_before
+            else:
+                apl_after = 0.0
+        else:
+            apl_after = float("inf")
+
+        hospital_ref = config.REFERENCE_HUB
+        hospital_node = min(
+            G_original.nodes(),
+            key=lambda n: (float(G_original.nodes[n].get("lat", 0)) - hospital_ref["lat"]) ** 2
+            + (float(G_original.nodes[n].get("lon", 0)) - hospital_ref["lon"]) ** 2,
+        )
+
+        unreachable_before = len(G_original) - len(nx.node_connected_component(G_original, hospital_node))
+        if hospital_node in G_failed:
+            unreachable_after = len(G_failed) - len(nx.node_connected_component(G_failed, hospital_node))
+        else:
+            unreachable_after = len(G_failed)
+
+        st.markdown(f"**Disaster Event:** `{sim_name}` | **Severed Core Nodes:** `{len(remove_nodes)}`")
+
+        # Top-level Real-World Impact KPI Cards
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric(
+            "Connectivity Retention",
+            f"{cr_after*100:.1f}%",
+            delta=f"{(cr_after - cr_before)*100:.2f}%",
+            delta_color="inverse",
+            help="Percentage of total urban network that remains reachable"
+        )
+        k2.metric(
+            "Disconnected Islands",
+            f"{cc_after} Sub-Nets",
+            delta=f"+{cc_after - cc_before} Isolated",
+            delta_color="inverse",
+            help="Number of fragmented disconnected network components"
+        )
+        k3.metric(
+            "Detour Commute Overhead",
+            f"{apl_after:.1f} Hops",
+            delta=f"+{apl_after - apl_before:.1f} Delay",
+            delta_color="inverse",
+            help="Average routing path length increase caused by severance"
+        )
+        k4.metric(
+            "Cutoff from Victoria Hospital",
+            f"{unreachable_after} Nodes",
+            delta=f"+{unreachable_after - unreachable_before} Trapped",
+            delta_color="inverse",
+            help="Number of road intersections unable to reach apex emergency medical trauma care"
+        )
+
+        # Actionable Civil Defense & Emergency Response Action Plan
+        st.markdown("#### Civil Defense & Emergency Response Directives")
+        st.markdown(f"""
+        <div class="info-card">
+            <b>Emergency Response Directives:</b>
+            <ul style="margin-top: 0.4rem; line-height: 1.7;">
+                <li><b>Traffic Diversion:</b> Severance of {len(remove_nodes)} arterial junction(s) requires immediate diversion via peripheral ring roads before congestion cascades.</li>
+                <li><b>Emergency Medical Isolation:</b> <b>{unreachable_after} road sectors</b> cannot reach Victoria Hospital. Deploy secondary mobile trauma stabilization units immediately.</li>
+                <li><b>Public Transit Re-Routing:</b> BMTC buses and emergency vehicles must avoid the {lm['name']} corridor and use secondary parallel connectors.</li>
+            </ul>
+        </div>
+        """, unsafe_allow_html=True)
+
+        st.markdown("<div class='section-divider'></div>", unsafe_allow_html=True)
+        st.markdown("#### Spatial Topography Comparison: Baseline vs. Post-Severance")
+        map_b, map_a = st.columns(2)
+
+        with map_b:
+            st.markdown("**Baseline (Intact Network - Chartreuse)**")
+            m_before = folium.Map(
+                location=[config.AOI["center_lat"], config.AOI["center_lon"]],
+                zoom_start=config.MAP_ZOOM_START + 1,
+                tiles="CartoDB dark_matter",
+                attr="CartoDB",
+            )
+            edges_b = list(G_original.edges())
+            step_b = max(1, len(edges_b) // 1500)
+            for u, v in edges_b[::step_b]:
+                pu = G_original.nodes[u].get("pos", (0, 0))
+                pv = G_original.nodes[v].get("pos", (0, 0))
+                folium.PolyLine(
+                    [(pu[1], pu[0]), (pv[1], pv[0])],
+                    color="#D4FF00", weight=2.0, opacity=0.85,
+                ).add_to(m_before)
+            for n in remove_nodes:
+                if n in G_original:
+                    pos = G_original.nodes[n].get("pos", (0, 0))
+                    folium.CircleMarker(
+                        [pos[1], pos[0]], radius=7,
+                        color="#FF20A8", fill=True, fill_color="#FF20A8",
+                        tooltip=f"Severed Chokepoint Node {n}",
+                    ).add_to(m_before)
+            st_folium(m_before, height=420, width="stretch", returned_objects=[], key="map_before_real")
+
+        with map_a:
+            st.markdown("**Post-Failure (Severed Hot Pink Links + Cluster Colors)**")
+            m_after = folium.Map(
+                location=[config.AOI["center_lat"], config.AOI["center_lon"]],
+                zoom_start=config.MAP_ZOOM_START + 1,
+                tiles="CartoDB dark_matter",
+                attr="CartoDB",
+            )
+            edges_a = list(G_failed.edges())
+            step_a = max(1, len(edges_a) // 1500)
+            for u, v in edges_a[::step_a]:
+                pu = G_failed.nodes[u].get("pos", (0, 0))
+                pv = G_failed.nodes[v].get("pos", (0, 0))
+                folium.PolyLine(
+                    [(pu[1], pu[0]), (pv[1], pv[0])],
+                    color="#FF20A8", weight=2.0, opacity=0.85,
+                ).add_to(m_after)
+
+            component_colors = ["#00d2d3", "#f39c12", "#D4FF00", "#9b59b6", "#3498db"]
+            top_comps = sorted(nx.connected_components(G_failed), key=len, reverse=True)[:8]
+            for i, comp in enumerate(top_comps):
+                color = component_colors[i % len(component_colors)]
+                for n in list(comp)[:60]:
+                    pos = G_failed.nodes[n].get("pos", (0, 0))
+                    folium.CircleMarker(
+                        [pos[1], pos[0]], radius=3.5,
+                        color=color, fill=True, fill_color=color,
+                        tooltip=f"Node {n} - Disconnected Cluster {i + 1}",
+                    ).add_to(m_after)
+            st_folium(m_after, height=420, width="stretch", returned_objects=[], key="map_after_real")
+
+
+# ============================================================
+# 5. URBAN SITE PLANNER — VACANT LAND & CORRIDOR ROUTING
+# ============================================================
+elif active_tab == "Urban Site Planner":
+    st.markdown("### Strategic Urban Site Planner & Vacant Land Advisor")
+    st.markdown(
+        "Identifies open and underutilized land parcels across Bengaluru, "
+        "evaluates arterial connectivity, and computes **real street routes to main city hubs** "
+        "to advise constructors and municipal engineers on optimal infrastructure investments."
+    )
+
+    st.markdown("""
+    <div class="info-card">
+        <b>Site Potential & Multi-Criteria Engine:</b><br>
+        Evaluates unbuilt land parcels by analyzing the <b>surrounding road network</b>, mapping the <b>highway ingress access point</b>, 
+        and computing <b>shortest street paths into the main city hubs</b> (CBD Core, Majestic Transit Hub, and Victoria Hospital). 
+        The recommendation engine ranks optimal infrastructure types (Trauma Care, Transit Hubs, Sponge-City Flood Basins, Logistics Depots) 
+        with capital expenditure budgets and ROI projections.
+    </div>
+    """, unsafe_allow_html=True)
+
+    col_sel, col_stats = st.columns([1, 2])
+
+    with col_sel:
+        st.markdown("#### Select Vacant Land Parcel")
+        parcel_names = [p["name"] for p in VACANT_PARCELS]
+        selected_name = st.selectbox("Parcel Selection", parcel_names, index=0)
+        selected_parcel = next(p for p in VACANT_PARCELS if p["name"] == selected_name)
+
+        st.markdown(f"**Zone:** {selected_parcel['zone']}")
+        st.markdown(f"**Developable Footprint:** `{selected_parcel['area_acres']:.1f} Acres` (~{selected_parcel['area_acres']*0.4047:.1f} Ha)")
+        st.markdown(f"**Current Zoning:** `{selected_parcel['zoning']}`")
+        st.markdown(f"**Terrain Profile:** {selected_parcel['terrain']}")
+        st.caption(selected_parcel["description"])
+
+    eval_result = _get_site_evaluation_cached(selected_parcel["id"])
+    if eval_result is None:
+        G_active, cent_active = _load_real_graph()
+        eval_result = evaluate_site_potential(
+            lat=selected_parcel["lat"],
+            lon=selected_parcel["lon"],
+            area_acres=selected_parcel["area_acres"],
+            graph=G_active,
+            centrality=cent_active,
+        )
+
+    with col_stats:
+        st.markdown("#### Geospatial Feasibility Index")
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("Parcel Area", f"{selected_parcel['area_acres']} Ac", help="Total developable parcel footprint")
+        k2.metric("Ingress Distance", f"{eval_result['ingress_point']['distance_m']:.0f} m", help="Distance to road network ingress gate")
+        k3.metric("Hospital Hub Radius", f"{eval_result['dist_hospital_km']:.1f} km", help="Distance to Victoria Hospital Emergency Trauma Hub")
+        k4.metric("Suitability Score", f"{eval_result['primary_recommendation']['suitability_score']}%", delta="High Alignment")
+
+    st.markdown("<div class='section-divider'></div>", unsafe_allow_html=True)
+    st.markdown("#### Vacant Land Parcels & Multi-Corridor City Connectivity")
+
+    ctrl_col1, ctrl_col2, ctrl_col3 = st.columns(3)
+    show_surrounding = ctrl_col1.checkbox("Show Surrounding Road Network (~1.8km)", value=True)
+    show_routes = ctrl_col2.checkbox("Show Routes to Main City Centers", value=True)
+    show_ingress = ctrl_col3.checkbox("Show Site Ingress Point", value=True)
+
+    m_vacant = folium.Map(
+        location=[selected_parcel["lat"], selected_parcel["lon"]],
+        zoom_start=13,
+        tiles="CartoDB dark_matter",
+        attr="CartoDB",
+    )
+
+    # 1. Surrounding Road Network Markings in Chartreuse
+    if show_surrounding and eval_result.get("surrounding_roads"):
+        road_group = folium.FeatureGroup(name="Surrounding Road Network")
+        folium.PolyLine(
+            locations=eval_result["surrounding_roads"],
+            color="#D4FF00",
+            weight=2.2,
+            opacity=0.88,
+            tooltip="Local Road Network Segment",
+        ).add_to(road_group)
+        road_group.add_to(m_vacant)
+
+    # 2. Main City Connector Routes (Distinct Strategic Corridors)
+    if show_routes and eval_result.get("main_city_routes"):
+        routes_group = folium.FeatureGroup(name="Main City Arterial Corridors")
+        for hub_key, route in eval_result["main_city_routes"].items():
+            route_coords = route.get("path_coords", route.get("coordinates", []))
+            if route_coords:
+                # Use Hot Pink for CBD and Chartreuse/Cyan for other hubs
+                r_color = "#FF20A8" if hub_key == "CBD_CORE" else ("#00d2d3" if hub_key == "MAJESTIC_HUB" else "#D4FF00")
+                folium.PolyLine(
+                    locations=route_coords,
+                    color=r_color,
+                    weight=4.5,
+                    opacity=0.92,
+                    tooltip=f"{route.get('corridor_name', 'Corridor')} ({route.get('distance_km', 0)} km, ~{route.get('est_time_min', route.get('estimated_time_min', 0))} min)",
+                ).add_to(routes_group)
+        routes_group.add_to(m_vacant)
+
+    # 3. Draw All Vacant Parcels
+    for p in VACANT_PARCELS:
+        is_selected = (p["id"] == selected_parcel["id"])
+        color = "#FF20A8" if is_selected else "#D4FF00"
+        fill_color = "#FF20A8" if is_selected else "#D4FF00"
+        fill_opacity = 0.55 if is_selected else 0.25
+        weight = 2.5 if is_selected else 1.2
+
+        folium.Polygon(
+            locations=p["polygon"],
+            color=color,
+            weight=weight,
+            fill=True,
+            fill_color=fill_color,
+            fill_opacity=fill_opacity,
+            tooltip=f"{p['name']} ({p['area_acres']} Ac)",
+            popup=f"<b>{p['name']}</b><br>Area: {p['area_acres']} Acres<br>Zoning: {p['zoning']}",
+        ).add_to(m_vacant)
+
+    # 4. Site Ingress Gate Marker
+    if show_ingress and "ingress_point" in eval_result:
+        ing = eval_result["ingress_point"]
+        folium.Marker(
+            location=[ing["lat"], ing["lon"]],
+            icon=folium.Icon(color="red", icon="sign-in", prefix="fa"),
+            tooltip=f"Site Highway Ingress Gate ({ing['distance_m']:.0f}m from parcel centroid)",
+            popup=f"<b>Site Ingress Gate</b><br>Connecting Road: {eval_result['nearest_landmark']}<br>Distance: {ing['distance_m']:.0f} m",
+        ).add_to(m_vacant)
+        folium.PolyLine(
+            locations=[[selected_parcel["lat"], selected_parcel["lon"]], [ing["lat"], ing["lon"]]],
+            color="#FF20A8",
+            weight=2.5,
+            dash_array="6",
+            tooltip="Ingress Connection Spur",
+        ).add_to(m_vacant)
+
+    # 5. City Hub Destination Markers
+    for h_k, h_v in MAIN_CITY_HUBS.items():
+        folium.Marker(
+            location=[h_v["lat"], h_v["lon"]],
+            icon=folium.Icon(color="purple" if h_k == "CBD_CORE" else ("blue" if h_k == "MAJESTIC_HUB" else "green"), icon=h_v["icon"], prefix="fa"),
+            tooltip=f"{h_v['name']} ({h_v['corridor_name']})",
+            popup=f"<b>{h_v['name']}</b><br>{h_v['corridor_name']}",
+        ).add_to(m_vacant)
+
+    folium.LayerControl().add_to(m_vacant)
+    st_folium(m_vacant, height=520, width="stretch", returned_objects=[], key="map_vacant_real")
+
+    # City Connectivity Table
+    if eval_result.get("main_city_routes"):
+        st.markdown("#### Main City Arterial Connectivity & Ingress Breakdown")
+        route_table_data = []
+        for h_k, route in eval_result["main_city_routes"].items():
+            route_table_data.append({
+                "Destination Hub": route.get("hub_name", route.get("name", "City Hub")),
+                "Strategic Connecting Corridor": route.get("corridor_name", "Connecting Corridor"),
+                "Street Distance": f"{route.get('distance_km', 0)} km",
+                "Transit Time (Normal)": f"~{route.get('est_time_min', route.get('estimated_time_min', 0))} min",
+                "Traversed Gatekeeper Bottlenecks": f"{route.get('gatekeepers_crossed', 0)} Chokepoint(s)",
+            })
+        st.dataframe(pd.DataFrame(route_table_data), width="stretch", hide_index=True)
+
+    # Constructor Recommendation Card
+    st.markdown("<div class='section-divider'></div>", unsafe_allow_html=True)
+    st.markdown("### Constructor Development Advisory & Feasibility Matrix")
+
+    prim = eval_result["primary_recommendation"]
+    if prim:
+        st.markdown(f"""
+        <div style="background: #111111; padding: 1.5rem 1.8rem; border-radius: 8px; border: 1px solid #1C1C1C; border-left: 5px solid #FF20A8; margin-bottom: 1.5rem;">
+            <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 0.8rem;">
+                <span style="font-size: 1.25rem; font-weight: 800; color: #ffffff; font-family: 'Space Grotesk', sans-serif;">{prim['type']}</span>
+                <span style="background-color: #1A1A1A; border: 1px solid #333333; color: #D4FF00; padding: 0.30rem 0.8rem; border-radius: 4px; font-weight: 700; font-size: 0.84rem; font-family: 'JetBrains Mono', monospace;">Suitability Score: {prim['suitability_score']}/100</span>
+            </div>
+            <p style="color: #FF20A8; font-weight: 600; margin-top: 0.4rem; font-size: 0.90rem;">Category: {prim['category']}</p>
+            <p style="color: #A0A0A0; line-height: 1.6; margin-top: 0.8rem; font-size: 0.95rem;">{prim['rationale']}</p>
+            <div style="display: flex; gap: 2.5rem; margin-top: 1.2rem; border-top: 1px solid #1A1A1A; padding-top: 1rem; flex-wrap: wrap;">
+                <div><span style="color: #666666; font-size: 0.78rem; text-transform: uppercase; font-weight: 600;">Estimated CAPEX:</span><br><b style="color: #ffffff; font-size: 1.1rem; font-family: 'Space Grotesk', sans-serif;">{prim['est_budget_cr']}</b></div>
+                <div><span style="color: #666666; font-size: 0.78rem; text-transform: uppercase; font-weight: 600;">Target ROI Horizon:</span><br><b style="color: #ffffff; font-size: 1.1rem; font-family: 'Space Grotesk', sans-serif;">{prim['roi_timeline']}</b></div>
+                <div><span style="color: #666666; font-size: 0.78rem; text-transform: uppercase; font-weight: 600;">Resilience Impact:</span><br><b style="color: #D4FF00; font-size: 1.05rem; font-family: 'Space Grotesk', sans-serif;">{prim['resilience_impact']}</b></div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    # DPR Expander
+    with st.expander("View Constructor Detailed Project Report (DPR) Brief"):
+        dpr_text = f"""# DETAILED PROJECT REPORT (DPR) BRIEF
+Site Identifier: {selected_parcel['id']} - {selected_parcel['name']}
+Geographic Coordinates: {selected_parcel['lat']}N, {selected_parcel['lon']}E
+Total Footprint: {selected_parcel['area_acres']:.1f} Acres (~{selected_parcel['area_acres']*0.4047:.2f} Ha)
+Target Plan: {prim['type']}
+
+1. Executive Site Assessment
+- Nearest Arterial Junction: {eval_result['ingress_point']['distance_m']:.0f} meters (Direct Ingress Access)
+- Distance to Central Medical Hub: {eval_result['dist_hospital_km']:.2f} km
+- Nearest Strategic Landmark: {eval_result['nearest_landmark']} ({eval_result['nearest_landmark_dist_km']:.2f} km)
+
+2. Constructor Rationale & Feasibility
+{prim['rationale']}
+
+3. Financial & Operational Overview
+- Estimated Capital Expenditure (CAPEX): {prim['est_budget_cr']}
+- Projected Return on Investment (ROI): {prim['roi_timeline']}
+- Urban Resilience Contribution: {prim['resilience_impact']}
+
+Report generated by Route Resilience Platform
+"""
+        st.code(dpr_text, language="markdown")
+
+
+# ╔══════════════════════════════════════════════════════════════╗
+# ║                        FOOTER                                ║
+# ╚══════════════════════════════════════════════════════════════╝
+
+st.markdown("<div class='section-divider'></div>", unsafe_allow_html=True)
+st.markdown(
+    """
+    <div style="text-align: center; color: #555555; padding: 1.2rem 1rem 2rem 1rem; font-size: 0.80rem; font-family: 'Inter', sans-serif;">
+        <span style="color: #FF20A8; font-weight: 700; font-family: 'Space Grotesk', sans-serif;">Route Resilience</span>
+        <span style="color: #333333; margin: 0 8px;">•</span>
+        <span>Road Network Criticality & Connectivity Analysis</span>
+        <span style="color: #333333; margin: 0 8px;">•</span>
+        <span style="color: #777777;">Bengaluru AOI</span>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)

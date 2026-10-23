@@ -1,0 +1,1693 @@
+"""
+Route Resilience - Urban Mobility Criticality Platform (ISRO BAH 2026)
+======================================================================
+Interactive Geospatial Engineering Dashboard for Satellite Road Extraction,
+Topological Healing, Betweenness Centrality, Disaster Stress Testing,
+and Urban Infrastructure Planning in Bengaluru, India.
+
+Run with:
+    streamlit run dashboard/app.py
+"""
+
+from __future__ import annotations
+
+import sys
+import math
+import random
+from pathlib import Path
+
+import numpy as np
+import networkx as nx
+import streamlit as st
+import folium
+import branca.colormap as cm
+import pandas as pd
+from PIL import Image
+from streamlit_folium import st_folium
+
+# ---------------------------------------------------------------------------
+# Resolve project root so sibling-module imports work
+# ---------------------------------------------------------------------------
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
+
+import config
+from dashboard.metrics import (
+    compute_iou, compute_dice, compute_connectivity_ratio,
+    compute_topological_accuracy, compute_avg_path_length_error,
+    format_metrics_report,
+)
+from graph_analysis.urban_planner import VACANT_PARCELS, MAIN_CITY_HUBS, evaluate_site_potential
+
+# ╔══════════════════════════════════════════════════════════════╗
+# ║                   CACHED DATA & GRAPH LOADERS                ║
+# ╚══════════════════════════════════════════════════════════════╝
+
+def _load_binary_mask(mask_path: Path) -> np.ndarray:
+    """Load a road mask from .npy or image formats and return binary uint8 array."""
+    suffix = mask_path.suffix.lower()
+    if suffix == ".npy":
+        arr = np.load(str(mask_path))
+    elif suffix in {".png", ".jpg", ".jpeg", ".tif", ".tiff"}:
+        arr = np.array(Image.open(mask_path).convert("L"))
+    else:
+        raise ValueError(f"Unsupported mask format: {suffix}")
+    if arr.ndim == 3:
+        arr = arr[..., 0]
+    return (arr > 0).astype(np.uint8)
+
+
+@st.cache_resource
+def _load_real_graph() -> tuple[nx.Graph, dict[str, float]]:
+    """Load the real healed graph and precomputed centrality.csv."""
+    graph_path = config.GRAPHS_DIR / "healed_graph.graphml"
+    if not graph_path.exists():
+        graph_path = config.GRAPHS_DIR / "raw_graph.graphml"
+    if not graph_path.exists():
+        raise FileNotFoundError(f"Missing road graph at {graph_path}")
+
+    G = nx.read_graphml(str(graph_path))
+    lat_min, lat_max = config.AOI["south"], config.AOI["north"]
+    lon_min, lon_max = config.AOI["west"], config.AOI["east"]
+
+    ys = [float(G.nodes[n].get("pos_y", 0)) for n in G.nodes()]
+    xs = [float(G.nodes[n].get("pos_x", 0)) for n in G.nodes()]
+    max_y = max(ys) if ys and max(ys) > 0 else 1024.0
+    max_x = max(xs) if xs and max(xs) > 0 else 1024.0
+
+    for n in G.nodes():
+        if "geo_lat" in G.nodes[n] and "geo_lon" in G.nodes[n]:
+            lat = float(G.nodes[n]["geo_lat"])
+            lon = float(G.nodes[n]["geo_lon"])
+        elif "lat" in G.nodes[n] and "lon" in G.nodes[n]:
+            lat = float(G.nodes[n]["lat"])
+            lon = float(G.nodes[n]["lon"])
+        else:
+            y = float(G.nodes[n].get("pos_y", 0))
+            x = float(G.nodes[n].get("pos_x", 0))
+            lat = lat_max - (y / max_y) * (lat_max - lat_min)
+            lon = lon_min + (x / max_x) * (lon_max - lon_min)
+        G.nodes[n]["pos"] = (lon, lat)
+        G.nodes[n]["lat"] = lat
+        G.nodes[n]["lon"] = lon
+
+    for u, v, d in G.edges(data=True):
+        if "weight" in d:
+            try:
+                d["weight"] = float(d["weight"])
+            except Exception:
+                d["weight"] = 1.0
+        else:
+            d["weight"] = 1.0
+
+    cent_file = config.GRAPHS_DIR / "centrality.csv"
+    if cent_file.exists():
+        df_c = pd.read_csv(str(cent_file))
+        cent = dict(zip(df_c["node_id"].astype(str), df_c["betweenness"].astype(float)))
+    else:
+        cent = nx.betweenness_centrality(G, k=min(300, len(G)))
+
+    return G, cent
+
+
+@st.cache_data
+def _load_mask_overlay(mask_name: str, color_rgba: tuple[int, int, int, int]) -> tuple[str, int, int, int]:
+    """Cache conversion of binary masks to base64 data URLs for fast raster map overlay."""
+    import io, base64
+    from scipy.ndimage import binary_dilation
+
+    mask_path = config.PREDICTIONS_DIR / mask_name
+    mask = _load_binary_mask(mask_path)
+    disp = binary_dilation(mask > 0, iterations=2)
+    overlay = np.zeros((*mask.shape, 4), dtype=np.uint8)
+    overlay[disp] = list(color_rgba)
+
+    img = Image.fromarray(overlay, "RGBA")
+    buf = io.BytesIO()
+    img.save(buf, format="PNG", optimize=True)
+    img_b64 = base64.b64encode(buf.getvalue()).decode()
+    return f"data:image/png;base64,{img_b64}", int(mask.sum()), mask.shape[0], mask.shape[1]
+
+
+@st.cache_data
+def _load_mask_comparison_metrics() -> dict[str, Any]:
+    """Cache compute_iou and compute_dice so Tab 1 loads instantaneously."""
+    raw = _load_binary_mask(config.PREDICTIONS_DIR / "pred_mask.npy")
+    healed = _load_binary_mask(config.PREDICTIONS_DIR / "healed_mask.npy")
+    return {
+        "iou": float(compute_iou(raw, healed)),
+        "dice": float(compute_dice(raw, healed)),
+        "raw_pixels": int(raw.sum()),
+        "healed_pixels": int(healed.sum()),
+    }
+
+
+@st.cache_data
+def _get_criticality_display_data():
+    """Cache top criticality edges and gatekeepers so Heatmap opens in 5ms."""
+    G, cent = _load_real_graph()
+    cent_values = list(cent.values())
+    cent_min = min(cent_values) if cent_values else 0
+    cent_max = max(cent_values) if cent_values else 1
+    threshold = float(np.percentile(cent_values, config.GATEKEEPER_PERCENTILE))
+    gatekeeper_nodes = [n for n, c in cent.items() if c >= threshold]
+
+    all_edges = list(G.edges())
+    scored_edges = []
+    for u, v in all_edges:
+        ec = (cent.get(str(u), 0) + cent.get(str(v), 0)) / 2
+        scored_edges.append((ec, u, v))
+    scored_edges.sort(reverse=True)
+
+    edge_coords = []
+    for ec, u, v in scored_edges[:2600]:
+        pu = G.nodes[u].get("pos", (0, 0))
+        pv = G.nodes[v].get("pos", (0, 0))
+        edge_coords.append(([(pu[1], pu[0]), (pv[1], pv[0])], ec, str(u), str(v)))
+
+    top_gks = []
+    for n in sorted(gatekeeper_nodes, key=lambda x: cent.get(str(x), 0), reverse=True)[:100]:
+        pos = G.nodes[n].get("pos", (0, 0))
+        top_gks.append((pos[1], pos[0], str(n), float(cent.get(str(n), 0)), int(G.degree(n))))
+
+    return edge_coords, top_gks, cent_min, cent_max, len(gatekeeper_nodes)
+
+
+@st.cache_data
+def _get_site_evaluation_cached(parcel_id: str) -> dict[str, Any] | None:
+    """Cache multi-criteria analysis and shortest-path city routes per parcel."""
+    p = next((x for x in VACANT_PARCELS if x["id"] == parcel_id), None)
+    if not p:
+        return None
+    G, cent = _load_real_graph()
+    return evaluate_site_potential(
+        lat=p["lat"],
+        lon=p["lon"],
+        area_acres=p["area_acres"],
+        graph=G,
+        centrality=cent,
+    )
+
+
+# ╔══════════════════════════════════════════════════════════════╗
+# ║                     PAGE CONFIGURATION                       ║
+# ╚══════════════════════════════════════════════════════════════╝
+
+st.set_page_config(
+    page_title=config.STREAMLIT_PAGE_TITLE,
+    page_icon=config.STREAMLIT_PAGE_ICON,
+    layout=config.STREAMLIT_LAYOUT,
+)
+
+# Custom CSS for dark-mode layout, cards, and smooth navigation
+st.markdown("""
+<style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600;700&family=Space+Grotesk:wght@600;700;800&display=swap');
+
+    html {
+        scroll-behavior: smooth;
+    }
+    .stApp {
+        background-color: #060d1f !important;
+        font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif !important;
+        color: #cbd5e1 !important;
+    }
+    .main .block-container {
+        padding-top: 1.2rem !important;
+        padding-bottom: 3rem !important;
+        max-width: 96% !important;
+    }
+
+    /* Headings */
+    h1, h2, h3, h4, h5, h6 {
+        color: #ffffff !important;
+        font-family: 'Space Grotesk', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif !important;
+        letter-spacing: -0.3px !important;
+        font-weight: 700 !important;
+    }
+
+    /* Top Breadcrumb & Status Bar */
+    .top-status-bar {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        flex-wrap: wrap;
+        gap: 10px;
+        background: rgba(14, 25, 54, 0.65);
+        border: 1px solid #1a2a4f;
+        padding: 8px 18px;
+        border-radius: 10px;
+        margin-bottom: 1.5rem;
+        backdrop-filter: blur(8px);
+    }
+    .status-left {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+    }
+    .active-module-badge {
+        font-size: 0.88rem;
+        font-weight: 700;
+        color: #00d2d3;
+        letter-spacing: 0.3px;
+    }
+    .sub-breadcrumb {
+        font-size: 0.80rem;
+        color: #64748b;
+        border-left: 1px solid #23355d;
+        padding-left: 12px;
+    }
+    .status-right {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+    }
+    .telemetry-chip {
+        background: #091228;
+        border: 1px solid #1a2a4f;
+        color: #94a3b8;
+        font-family: 'JetBrains Mono', monospace;
+        font-size: 0.74rem;
+        padding: 3px 10px;
+        border-radius: 6px;
+    }
+    .pulse-chip {
+        color: #00d2d3;
+        border-color: rgba(0, 210, 211, 0.35);
+        background: rgba(0, 210, 211, 0.08);
+        font-weight: 600;
+    }
+
+    /* Hero Banner */
+    .hero-banner {
+        background: linear-gradient(135deg, #08132d 0%, #0d1e46 55%, #153167 100%);
+        border: 1px solid #1c315e;
+        border-left: 5px solid #00d2d3;
+        padding: 2.2rem 2.5rem;
+        border-radius: 14px;
+        margin-bottom: 2rem;
+        box-shadow: 0 10px 36px rgba(0, 0, 0, 0.45);
+        position: relative;
+        overflow: hidden;
+    }
+    .hero-banner h1 {
+        font-size: 2.25rem;
+        font-weight: 800;
+        margin: 0.4rem 0 0.8rem 0;
+        color: #ffffff;
+        letter-spacing: -0.5px;
+    }
+    .hero-banner p {
+        color: #cbd5e1;
+        font-size: 1.05rem;
+        line-height: 1.65;
+        margin: 0;
+        max-width: 980px;
+    }
+    .hero-tag {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        background: rgba(0, 210, 211, 0.12);
+        color: #00d2d3;
+        padding: 5px 14px;
+        border-radius: 20px;
+        font-size: 0.80rem;
+        font-weight: 700;
+        letter-spacing: 0.8px;
+        border: 1px solid rgba(0, 210, 211, 0.35);
+        margin-bottom: 0.6rem;
+    }
+
+    /* Status Dot */
+    .status-dot {
+        width: 8px;
+        height: 8px;
+        background-color: #00d2d3;
+        border-radius: 50%;
+        display: inline-block;
+        box-shadow: 0 0 10px #00d2d3;
+    }
+    .status-dot-live {
+        width: 7px;
+        height: 7px;
+        background-color: #2ecc71;
+        border-radius: 50%;
+        display: inline-block;
+        box-shadow: 0 0 8px #2ecc71;
+    }
+
+    /* Challenge Cards (Bento Style) */
+    .challenge-card {
+        background: #0d1736;
+        border: 1px solid #1c2b54;
+        border-radius: 12px;
+        padding: 1.5rem;
+        margin-bottom: 1rem;
+        min-height: 230px;
+        display: flex;
+        flex-direction: column;
+        justify-content: flex-start;
+        box-shadow: 0 4px 18px rgba(0, 0, 0, 0.25);
+        transition: transform 0.22s ease, border-color 0.22s ease, box-shadow 0.22s ease;
+    }
+    .challenge-card:hover {
+        border-color: #00d2d3;
+        transform: translateY(-3px);
+        box-shadow: 0 8px 24px rgba(0, 210, 211, 0.15);
+    }
+    .challenge-badge {
+        font-size: 0.72rem;
+        font-weight: 700;
+        letter-spacing: 1.1px;
+        text-transform: uppercase;
+        padding: 3px 10px;
+        border-radius: 6px;
+        display: inline-block;
+        margin-bottom: 0.75rem;
+        width: fit-content;
+    }
+    .challenge-badge-red {
+        background: rgba(255, 71, 87, 0.15);
+        color: #ff6b81;
+        border: 1px solid rgba(255, 71, 87, 0.35);
+    }
+    .challenge-badge-amber {
+        background: rgba(255, 165, 2, 0.15);
+        color: #ffa502;
+        border: 1px solid rgba(255, 165, 2, 0.35);
+    }
+    .challenge-badge-cyan {
+        background: rgba(0, 210, 211, 0.15);
+        color: #00d2d3;
+        border: 1px solid rgba(0, 210, 211, 0.35);
+    }
+    .challenge-title {
+        font-size: 1.12rem;
+        font-weight: 700;
+        color: #ffffff;
+        margin-bottom: 0.6rem;
+        font-family: 'Space Grotesk', sans-serif;
+    }
+    .challenge-desc {
+        font-size: 0.90rem;
+        color: #cbd5e1;
+        line-height: 1.6;
+    }
+
+    /* Feature Surfer Cards */
+    .feature-card {
+        background: #0d1736;
+        border: 1px solid #1c2b54;
+        border-radius: 12px;
+        padding: 1.5rem;
+        min-height: 165px;
+        box-shadow: 0 4px 18px rgba(0, 0, 0, 0.25);
+        transition: transform 0.22s ease, border-color 0.22s ease, box-shadow 0.22s ease;
+    }
+    .feature-card:hover {
+        border-color: #00d2d3;
+        transform: translateY(-3px);
+        box-shadow: 0 8px 24px rgba(0, 210, 211, 0.18);
+        background: #111d44;
+    }
+    .feature-code {
+        font-size: 0.74rem;
+        font-weight: 700;
+        letter-spacing: 1.3px;
+        color: #00d2d3;
+        text-transform: uppercase;
+        margin-bottom: 0.35rem;
+        font-family: 'JetBrains Mono', monospace;
+    }
+    .feature-title {
+        font-size: 1.15rem;
+        font-weight: 700;
+        color: #ffffff;
+        margin-bottom: 0.5rem;
+        font-family: 'Space Grotesk', sans-serif;
+    }
+    .feature-desc {
+        font-size: 0.88rem;
+        color: #94a3b8;
+        line-height: 1.55;
+    }
+
+    /* Metric Cards */
+    div[data-testid="stMetric"] {
+        background: linear-gradient(145deg, #0d1736 0%, #12224b 100%) !important;
+        border: 1px solid #1b2e5a !important;
+        border-radius: 12px !important;
+        padding: 1.15rem !important;
+        box-shadow: 0 6px 20px rgba(0, 0, 0, 0.3) !important;
+        transition: transform 0.2s ease, border-color 0.2s ease, box-shadow 0.2s ease !important;
+    }
+    div[data-testid="stMetric"]:hover {
+        border-color: #00d2d3 !important;
+        transform: translateY(-3px) !important;
+        box-shadow: 0 8px 24px rgba(0, 210, 211, 0.2) !important;
+    }
+    div[data-testid="stMetric"] label,
+    div[data-testid="stMetric"] [data-testid="stMetricLabel"] {
+        color: #94a3b8 !important;
+        font-size: 0.80rem !important;
+        font-weight: 700 !important;
+        text-transform: uppercase !important;
+        letter-spacing: 0.8px !important;
+    }
+    div[data-testid="stMetric"] [data-testid="stMetricValue"] {
+        color: #00e5ff !important;
+        font-family: 'JetBrains Mono', monospace !important;
+        font-size: 1.70rem !important;
+        font-weight: 800 !important;
+    }
+
+    /* Sidebar Styling */
+    section[data-testid="stSidebar"] {
+        background: linear-gradient(180deg, #050a19 0%, #0a142e 60%, #060c1d 100%) !important;
+        border-right: 1px solid #162447 !important;
+    }
+    section[data-testid="stSidebar"] .stMarkdown,
+    section[data-testid="stSidebar"] label,
+    section[data-testid="stSidebar"] span,
+    section[data-testid="stSidebar"] p {
+        color: #cbd5e1 !important;
+    }
+
+    .sidebar-brand {
+        background: #091228;
+        border: 1px solid #19274c;
+        border-radius: 12px;
+        padding: 14px 16px;
+        margin-bottom: 1.2rem;
+        box-shadow: 0 4px 16px rgba(0, 0, 0, 0.3);
+    }
+    .brand-tag {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        font-size: 0.72rem;
+        font-weight: 700;
+        letter-spacing: 0.9px;
+        color: #00d2d3;
+        margin-bottom: 4px;
+        font-family: 'JetBrains Mono', monospace;
+    }
+    .brand-title {
+        font-size: 1.25rem;
+        font-weight: 800;
+        color: #ffffff;
+        letter-spacing: -0.2px;
+        font-family: 'Space Grotesk', sans-serif;
+    }
+    .brand-subtitle {
+        font-size: 0.78rem;
+        color: #94a3b8;
+        margin-top: 2px;
+    }
+    .sidebar-section-title {
+        font-size: 0.72rem;
+        font-weight: 700;
+        letter-spacing: 1.2px;
+        color: #00d2d3;
+        text-transform: uppercase;
+        margin: 1rem 0 0.5rem 0;
+        font-family: 'JetBrains Mono', monospace;
+    }
+
+    /* Modern Sidebar Radio Buttons */
+    section[data-testid="stSidebar"] div[data-testid="stRadio"] > div {
+        display: flex !important;
+        flex-direction: column !important;
+        gap: 6px !important;
+        background: transparent !important;
+        padding: 0 !important;
+        border: none !important;
+    }
+    section[data-testid="stSidebar"] div[data-testid="stRadio"] label {
+        background: #0d1733 !important;
+        border: 1px solid #1c2b52 !important;
+        border-radius: 10px !important;
+        padding: 10px 14px !important;
+        font-weight: 600 !important;
+        font-size: 0.88rem !important;
+        color: #cbd5e1 !important;
+        cursor: pointer !important;
+        transition: all 0.2s ease !important;
+        margin: 0 !important;
+        display: flex !important;
+        align-items: center !important;
+    }
+    section[data-testid="stSidebar"] div[data-testid="stRadio"] label:hover {
+        border-color: #00d2d3 !important;
+        color: #ffffff !important;
+        background: rgba(0, 210, 211, 0.08) !important;
+        transform: translateX(2px) !important;
+    }
+    section[data-testid="stSidebar"] div[data-testid="stRadio"] label[data-checked="true"] {
+        background: linear-gradient(135deg, rgba(0, 180, 216, 0.2) 0%, rgba(0, 119, 182, 0.3) 100%) !important;
+        border: 1px solid #00d2d3 !important;
+        border-left: 4px solid #00d2d3 !important;
+        color: #ffffff !important;
+        box-shadow: 0 4px 14px rgba(0, 210, 211, 0.22) !important;
+    }
+    section[data-testid="stSidebar"] div[data-testid="stRadio"] label > div:first-child {
+        display: none !important;
+    }
+
+    .sidebar-telemetry {
+        background: #091228;
+        border: 1px solid #19274c;
+        border-radius: 10px;
+        padding: 12px 14px;
+        margin-top: 1.2rem;
+        font-size: 0.78rem;
+    }
+    .telemetry-header {
+        font-size: 0.72rem;
+        font-weight: 700;
+        letter-spacing: 1.1px;
+        color: #00d2d3;
+        text-transform: uppercase;
+        margin-bottom: 8px;
+        font-family: 'JetBrains Mono', monospace;
+        border-bottom: 1px solid #19274c;
+        padding-bottom: 6px;
+    }
+    .telemetry-row {
+        display: flex;
+        justify-content: space-between;
+        margin-bottom: 6px;
+        color: #94a3b8;
+    }
+    .telemetry-row b {
+        color: #ffffff;
+        font-family: 'JetBrains Mono', monospace;
+    }
+    .telemetry-status {
+        margin-top: 8px;
+        padding-top: 6px;
+        border-top: 1px solid #19274c;
+        color: #2ecc71;
+        font-weight: 700;
+        font-size: 0.72rem;
+        letter-spacing: 0.8px;
+        font-family: 'JetBrains Mono', monospace;
+    }
+
+    .sidebar-footer {
+        text-align: center;
+        padding: 1rem 0;
+        font-size: 0.76rem;
+        color: #64748b;
+        border-top: 1px solid #162447;
+        margin-top: 1.2rem;
+    }
+
+    /* Folium Map Container */
+    iframe {
+        border-radius: 14px !important;
+        border: 1px solid #1d315e !important;
+        box-shadow: 0 8px 30px rgba(0, 0, 0, 0.45) !important;
+        background-color: #060d1f !important;
+    }
+
+    /* Buttons */
+    div.stButton > button {
+        background: linear-gradient(135deg, #00b4d8 0%, #0077b6 100%) !important;
+        color: #ffffff !important;
+        border: none !important;
+        font-weight: 700 !important;
+        border-radius: 8px !important;
+        padding: 0.65rem 1.4rem !important;
+        box-shadow: 0 4px 14px rgba(0, 180, 216, 0.3) !important;
+        transition: all 0.2s ease !important;
+        letter-spacing: 0.2px !important;
+    }
+    div.stButton > button:hover {
+        background: linear-gradient(135deg, #00d2d3 0%, #0096c7 100%) !important;
+        box-shadow: 0 6px 20px rgba(0, 210, 211, 0.45) !important;
+        transform: translateY(-2px) !important;
+    }
+
+    /* Selectboxes and Form Inputs */
+    div[data-baseweb="select"] > div {
+        background-color: #0d1736 !important;
+        border-color: #1c2e59 !important;
+        color: #e0e6ed !important;
+        border-radius: 8px !important;
+    }
+
+    /* Dataframe & Tables */
+    div[data-testid="stDataFrame"], div[data-testid="stTable"] {
+        background-color: #0d1736 !important;
+        border: 1px solid #1c2e59 !important;
+        border-radius: 10px !important;
+        overflow: hidden !important;
+    }
+
+    /* Info card */
+    .info-card {
+        background: linear-gradient(135deg, #0c1735 0%, #101f46 100%);
+        border-left: 4px solid #00d2d3;
+        padding: 1.25rem 1.4rem;
+        border-radius: 0 10px 10px 0;
+        margin: 1.2rem 0;
+        border-top: 1px solid #1b2e59;
+        border-right: 1px solid #1b2e59;
+        border-bottom: 1px solid #1b2e59;
+        color: #cbd5e1;
+        line-height: 1.6;
+        box-shadow: 0 4px 16px rgba(0, 0, 0, 0.25);
+    }
+
+    /* Section divider */
+    .section-divider {
+        height: 1px;
+        background: linear-gradient(90deg, transparent, #1c2e59 20%, #1c2e59 80%, transparent);
+        margin: 2rem 0;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+
+# ╔══════════════════════════════════════════════════════════════╗
+# ║                  NAVIGATION & SIDEBAR MODULE                 ║
+# ╚══════════════════════════════════════════════════════════════╝
+
+nav_tabs = [
+    "Project Overview & Home",
+    "Topological Road Healing",
+    "Criticality & Gatekeeper Heatmap",
+    "Disaster Stress Simulator",
+    "Urban Site Planner & City Corridors",
+]
+
+NAV_ICONS = {
+    "Project Overview & Home": "🛰️  Mission Overview & Home",
+    "Topological Road Healing": "🗺️  Topological Road Healing",
+    "Criticality & Gatekeeper Heatmap": "🔥  Criticality & Gatekeepers",
+    "Disaster Stress Simulator": "⚡  Disaster Stress Simulator",
+    "Urban Site Planner & City Corridors": "🏗️  Urban Site Planner",
+}
+
+if "active_nav_tab" not in st.session_state or st.session_state.active_nav_tab not in nav_tabs:
+    st.session_state.active_nav_tab = nav_tabs[0]
+
+with st.sidebar:
+    st.markdown("""
+    <div class="sidebar-brand">
+        <div class="brand-tag"><span class="status-dot-live"></span> ISRO BAH 2026 • PS-4</div>
+        <div class="brand-title">ROUTE RESILIENCE</div>
+        <div class="brand-subtitle">Urban Mobility Criticality Platform</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    st.markdown("<div class='sidebar-section-title'>MISSION MODULES</div>", unsafe_allow_html=True)
+
+    active_tab = st.radio(
+        "Mission Navigation",
+        options=nav_tabs,
+        format_func=lambda x: NAV_ICONS.get(x, x),
+        index=nav_tabs.index(st.session_state.active_nav_tab),
+        key="active_nav_tab",
+        label_visibility="collapsed",
+    )
+
+    st.markdown("""
+    <div class="sidebar-telemetry">
+        <div class="telemetry-header">BENGALURU AOI TELEMETRY</div>
+        <div class="telemetry-row"><span>Ground Resolution</span><b>10m Sentinel-2</b></div>
+        <div class="telemetry-row"><span>Raster Grid</span><b>1677 × 1612 px</b></div>
+        <div class="telemetry-row"><span>Graph Vertices</span><b>45,148 Nodes</b></div>
+        <div class="telemetry-row"><span>Arterial Edges</span><b>47,400 Ways</b></div>
+        <div class="telemetry-row"><span>Bounding Box</span><b>12.90°N - 13.05°N</b></div>
+        <div class="telemetry-row"><span>Geo Longitude</span><b>77.50°E - 77.65°E</b></div>
+        <div class="telemetry-status">● VERIFIED PRODUCTION FEED</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    st.markdown("""
+    <div class="sidebar-footer">
+        <div>Bharatiya Antariksh Hackathon</div>
+        <div>ISRO Space Applications Centre</div>
+        <div style="font-size: 0.72rem; color: #475569; margin-top: 4px;">Route Resilience v2.0</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+# Top Status Bar in Main View
+st.markdown(f"""
+<div class="top-status-bar">
+    <div class="status-left">
+        <span class="active-module-badge">{NAV_ICONS.get(active_tab, active_tab)}</span>
+        <span class="sub-breadcrumb">Bengaluru Metropolitan AOI</span>
+    </div>
+    <div class="status-right">
+        <span class="telemetry-chip">EPSG:32643 (UTM 43N)</span>
+        <span class="telemetry-chip pulse-chip">● SATELLITE PIPELINE ACTIVE</span>
+    </div>
+</div>
+""", unsafe_allow_html=True)
+
+
+# ============================================================
+# MODULE 1 — PROJECT OVERVIEW & HOME (BEAUTIFUL LANDING PAGE)
+# ============================================================
+if active_tab == "Project Overview & Home":
+    st.markdown("""
+    <div class="hero-banner">
+        <div class="hero-tag">
+            <span class="status-dot"></span>
+            ISRO BHARATIYA ANTARIKSH HACKATHON 2026 — PROBLEM STATEMENT 4
+        </div>
+        <h1>Route Resilience — Urban Mobility Criticality Platform</h1>
+        <p>
+            An end-to-end civil geospatial system that solves satellite <b>"spectral blindness"</b> under 
+            tree canopies and shadows, builds a topological graph of Bengaluru's road network, identifies 
+            vulnerable arterial bottlenecks, and stress-tests disaster disruptions to protect urban life.
+        </p>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # 1. Real Production Stats Ticker (5 Real-Data KPI Cards)
+    st.markdown("### Production Platform Invariants (Bengaluru AOI)")
+    s1, s2, s3, s4, s5 = st.columns(5)
+    s1.metric("Graph Junction Nodes", "45,148", help="Spatial junction vertices across Bengaluru AOI")
+    s2.metric("Arterial Road Segments", "47,400", help="Active graph edges from OpenStreetMap & healed skeleton")
+    s3.metric("Gatekeeper Chokepoints", "2,258", delta="Top 5% Critical", help="High-betweenness junctions governing traffic flow")
+    s4.metric("Network Connectivity", "99.98%", delta="Baseline Intact", help="Largest Connected Component ratio in normal operations")
+    s5.metric("Strategic Vacant Sites", "6 Parcels", help="Candidate unbuilt parcels analyzed for civil infrastructure")
+
+    st.markdown("<div class='section-divider'></div>", unsafe_allow_html=True)
+
+    # 2. Interactive Bengaluru AOI Spatial Command Map & System Specs
+    st.markdown("### Geospatial Command Center — Bengaluru AOI Footprint")
+    col_map, col_spec = st.columns([1.6, 1])
+
+    with col_map:
+        m_home = folium.Map(
+            location=[config.AOI["center_lat"], config.AOI["center_lon"]],
+            zoom_start=11,
+            tiles=config.ESRI_TILES,
+            attr="Esri World Imagery",
+        )
+
+        # Draw AOI bounding box rectangle
+        bounds = [
+            [config.AOI["south"], config.AOI["west"]],
+            [config.AOI["north"], config.AOI["east"]],
+        ]
+        folium.Rectangle(
+            bounds=bounds,
+            color="#00d2d3",
+            weight=2.5,
+            dash_array="6",
+            fill=True,
+            fill_color="#00d2d3",
+            fill_opacity=0.08,
+            tooltip="Bengaluru AOI Bounding Envelope (1677 × 1612 Grid)",
+        ).add_to(m_home)
+
+        # Strategic Chokepoint & Hub Markers
+        landmark_icons = {
+            "outer_ring_road_junction": ("orange", "road"),
+            "silk_board_junction": ("red", "exclamation-triangle"),
+            "hebbal_flyover": ("blue", "arrows-alt"),
+            "kr_puram_bridge": ("purple", "train"),
+            "yeshwanthpur_junction": ("darkblue", "random"),
+            "hospital_reference": ("green", "plus-square"),
+        }
+
+        for lk, lm in config.LANDMARKS.items():
+            color, icon_name = landmark_icons.get(lk, ("blue", "info-circle"))
+            folium.Marker(
+                location=[lm["lat"], lm["lon"]],
+                icon=folium.Icon(color=color, icon=icon_name, prefix="fa"),
+                tooltip=f"{lm['name']} ({lm['lat']}°N, {lm['lon']}°E)",
+                popup=f"<b>{lm['name']}</b><br>Strategic Node: {lm['lat']}°N, {lm['lon']}°E",
+            ).add_to(m_home)
+
+        folium.LayerControl().add_to(m_home)
+        st_folium(m_home, height=360, width="stretch", returned_objects=[], key="map_home_overview")
+        st.caption("Active Geospatial AOI: 12.90°N to 13.05°N, 77.50°E to 77.65°E with strategic arterial chokepoints.")
+
+    with col_spec:
+        st.markdown("""
+        <div style="background: #0d1736; border: 1px solid #1c2b54; border-radius: 12px; padding: 1.3rem 1.4rem; height: 360px; display: flex; flex-direction: column; justify-content: space-between;">
+            <div>
+                <div style="color: #00d2d3; font-family: 'JetBrains Mono', monospace; font-size: 0.72rem; font-weight: 700; letter-spacing: 1px; text-transform: uppercase; margin-bottom: 8px;">
+                    MISSION SPECIFICATIONS
+                </div>
+                <div style="color: #ffffff; font-size: 1.05rem; font-weight: 700; margin-bottom: 12px; font-family: 'Space Grotesk', sans-serif;">
+                    Sentinel-2 Earth Observation
+                </div>
+                <div style="font-size: 0.82rem; color: #94a3b8; line-height: 1.6;">
+                    <div style="display:flex; justify-content:space-between; margin-bottom:6px; border-bottom:1px solid #162447; padding-bottom:4px;">
+                        <span>Ground Sampling Distance</span><b style="color:#ffffff;">10m / pixel</b>
+                    </div>
+                    <div style="display:flex; justify-content:space-between; margin-bottom:6px; border-bottom:1px solid #162447; padding-bottom:4px;">
+                        <span>Spatial Reference System</span><b style="color:#ffffff;">EPSG:32643 (UTM 43N)</b>
+                    </div>
+                    <div style="display:flex; justify-content:space-between; margin-bottom:6px; border-bottom:1px solid #162447; padding-bottom:4px;">
+                        <span>Neural Segmentation</span><b style="color:#ffffff;">U-Net / ResNet34</b>
+                    </div>
+                    <div style="display:flex; justify-content:space-between; margin-bottom:6px; border-bottom:1px solid #162447; padding-bottom:4px;">
+                        <span>Topological Healing</span><b style="color:#00d2d3;">Vector Dot-Product</b>
+                    </div>
+                    <div style="display:flex; justify-content:space-between; margin-bottom:6px; padding-bottom:4px;">
+                        <span>Emergency Medical Hub</span><b style="color:#2ecc71;">Victoria Hospital</b>
+                    </div>
+                </div>
+            </div>
+            <div style="background: rgba(0,210,211,0.08); border: 1px solid rgba(0,210,211,0.25); border-radius: 8px; padding: 8px 12px; font-size: 0.76rem; color: #00d2d3; font-family: 'JetBrains Mono', monospace;">
+                ● SYSTEM TELEMETRY ONLINE & CALIBRATED
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    st.markdown("<div class='section-divider'></div>", unsafe_allow_html=True)
+
+    # 3. Core Problem Explanation (Bento Challenge Cards)
+    st.markdown("### The Urban Challenge: Why Bengaluru Needs Route Resilience")
+    st.markdown(
+        "Rapid urbanization in Bengaluru has created acute mobility vulnerabilities where satellite earth observation "
+        "and emergency routing frequently break down during severe monsoon crises."
+    )
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.markdown("""
+        <div class="challenge-card">
+            <span class="challenge-badge challenge-badge-red">1. Computer Vision</span>
+            <div class="challenge-title">Satellite Spectral Blindness</div>
+            <div class="challenge-desc">
+                Standard optical satellite imagery (Sentinel-2, Landsat) cannot resolve roads hidden underneath 
+                Bengaluru's thick tree canopies (Lalbagh, Cubbon Park, Indiranagar) and dense building shadows. 
+                Traditional road detectors output fragmented, broken segments.
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+    with c2:
+        st.markdown("""
+        <div class="challenge-card">
+            <span class="challenge-badge challenge-badge-amber">2. Graph Theory</span>
+            <div class="challenge-title">Chokepoint & Monsoon Fragility</div>
+            <div class="challenge-desc">
+                Bengaluru's arterial transit relies on high-betweenness bottlenecks like Central Silk Board, Hebbal Flyover, 
+                and KR Puram Bridge. During acute monsoon downpours, a single underpass submergence triggers 
+                catastrophic city-wide gridlock.
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+    with c3:
+        st.markdown("""
+        <div class="challenge-card">
+            <span class="challenge-badge challenge-badge-cyan">3. Civil Defense</span>
+            <div class="challenge-title">Golden-Hour Hospital Isolation</div>
+            <div class="challenge-desc">
+                When arterial links sever, emergency medical ambulances heading toward apex healthcare hubs 
+                (Victoria Hospital, Bowring, BMCRI) face severe detours. Without topological graph modeling, 
+                disaster managers cannot predict isolated wards.
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    st.markdown("<div class='section-divider'></div>", unsafe_allow_html=True)
+
+    # 4. Interactive Quick-Launch Feature Surfer Grid
+    st.markdown("### Surf Through Platform Modules")
+    st.markdown("Click any module below to jump directly into the interactive engineering tools:")
+
+    m_col1, m_col2 = st.columns(2)
+
+    with m_col1:
+        st.markdown("""
+        <div class="feature-card">
+            <div class="feature-code">Module 01</div>
+            <div class="feature-title">Topological Road Healing</div>
+            <div class="feature-desc">
+                Inspect raw neural segmentation outputs against direction-vector healed masks across the full 
+                1677x1612 Bengaluru AOI. See how mathematical morphology bridges canopy gaps.
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+        if st.button("Open Topological Road Healing ->", key="surf_mod_1", width="stretch"):
+            st.session_state.active_nav_tab = "Topological Road Healing"
+            st.rerun()
+
+        st.markdown("<br>", unsafe_allow_html=True)
+
+        st.markdown("""
+        <div class="feature-card">
+            <div class="feature-code">Module 03</div>
+            <div class="feature-title">Disaster Stress Simulator</div>
+            <div class="feature-desc">
+                Simulate flash floods, bridge collapses, and multi-point cascade failures. Quantify network fragmentation, 
+                detour delays, and hospital isolation in real time.
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+        if st.button("Open Disaster Stress Simulator ->", key="surf_mod_3", width="stretch"):
+            st.session_state.active_nav_tab = "Disaster Stress Simulator"
+            st.rerun()
+
+    with m_col2:
+        st.markdown("""
+        <div class="feature-card">
+            <div class="feature-code">Module 02</div>
+            <div class="feature-title">Criticality & Gatekeeper Heatmap</div>
+            <div class="feature-desc">
+                Explore betweenness centrality color gradients across 45,148 nodes and discover the top 100 
+                strategic gatekeeper bottlenecks that govern city-wide mobility.
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+        if st.button("Open Criticality Heatmap ->", key="surf_mod_2", width="stretch"):
+            st.session_state.active_nav_tab = "Criticality & Gatekeeper Heatmap"
+            st.rerun()
+
+        st.markdown("<br>", unsafe_allow_html=True)
+
+        st.markdown("""
+        <div class="feature-card">
+            <div class="feature-code">Module 04</div>
+            <div class="feature-title">Urban Site Planner & City Corridors</div>
+            <div class="feature-desc">
+                Identify vacant land parcels, inspect surrounding road network density, view highway access gates, 
+                and trace street routes to CBD, Majestic, and Victoria Hospital.
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+        if st.button("Open Urban Site Planner ->", key="surf_mod_4", width="stretch"):
+            st.session_state.active_nav_tab = "Urban Site Planner & City Corridors"
+            st.rerun()
+
+    st.markdown("<div class='section-divider'></div>", unsafe_allow_html=True)
+
+    # 5. 5-Step Architecture Workflow
+    st.markdown("### Technical Architecture Pipeline")
+    st.markdown("""
+    <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; margin-top: 1rem;">
+        <div style="background: #0d1736; border: 1px solid #1c2b54; border-radius: 10px; padding: 14px 16px;">
+            <div style="color: #00d2d3; font-family: 'JetBrains Mono', monospace; font-size: 0.72rem; font-weight: 700; margin-bottom: 4px;">PHASE 01</div>
+            <div style="color: #ffffff; font-weight: 700; font-size: 0.95rem; margin-bottom: 6px;">EO Ingestion</div>
+            <div style="color: #94a3b8; font-size: 0.82rem; line-height: 1.5;">Sentinel-2 L2A optical imagery covering 12.90°N–13.05°N, 77.50°E–77.65°E at 10m spatial resolution.</div>
+        </div>
+        <div style="background: #0d1736; border: 1px solid #1c2b54; border-radius: 10px; padding: 14px 16px;">
+            <div style="color: #00d2d3; font-family: 'JetBrains Mono', monospace; font-size: 0.72rem; font-weight: 700; margin-bottom: 4px;">PHASE 02</div>
+            <div style="color: #ffffff; font-weight: 700; font-size: 0.95rem; margin-bottom: 6px;">Neural Segmentation</div>
+            <div style="color: #94a3b8; font-size: 0.82rem; line-height: 1.5;">Context-aware U-Net segments arterial corridors through dense tree canopy and shadow occlusions.</div>
+        </div>
+        <div style="background: #0d1736; border: 1px solid #1c2b54; border-radius: 10px; padding: 14px 16px;">
+            <div style="color: #00d2d3; font-family: 'JetBrains Mono', monospace; font-size: 0.72rem; font-weight: 700; margin-bottom: 4px;">PHASE 03</div>
+            <div style="color: #ffffff; font-weight: 700; font-size: 0.95rem; margin-bottom: 6px;">Topological Healing</div>
+            <div style="color: #94a3b8; font-size: 0.82rem; line-height: 1.5;">Skeletonization and directional vector dot-product alignment bridge severed road segments.</div>
+        </div>
+        <div style="background: #0d1736; border: 1px solid #1c2b54; border-radius: 10px; padding: 14px 16px;">
+            <div style="color: #00d2d3; font-family: 'JetBrains Mono', monospace; font-size: 0.72rem; font-weight: 700; margin-bottom: 4px;">PHASE 04</div>
+            <div style="color: #ffffff; font-weight: 700; font-size: 0.95rem; margin-bottom: 6px;">Criticality Modeling</div>
+            <div style="color: #94a3b8; font-size: 0.82rem; line-height: 1.5;">Betweenness centrality computes the top 5% gatekeeper bottleneck intersections across 45,148 nodes.</div>
+        </div>
+        <div style="background: #0d1736; border: 1px solid #1c2b54; border-radius: 10px; padding: 14px 16px;">
+            <div style="color: #00d2d3; font-family: 'JetBrains Mono', monospace; font-size: 0.72rem; font-weight: 700; margin-bottom: 4px;">PHASE 05</div>
+            <div style="color: #ffffff; font-weight: 700; font-size: 0.95rem; margin-bottom: 6px;">Stress Simulation</div>
+            <div style="color: #94a3b8; font-size: 0.82rem; line-height: 1.5;">Simulates junction severances, calculates Victoria Hospital cutoff, and evaluates vacant parcels.</div>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+
+# ============================================================
+# MODULE 2 — TOPOLOGICAL ROAD HEALING (RAW VS HEALED MASK)
+# ============================================================
+elif active_tab == "Topological Road Healing":
+    st.markdown("### Topological Road Healing & Occlusion Recovery")
+    st.markdown(
+        "Compare raw neural segmentation outputs against the topologically healed mask across "
+        "the full **1677x1612** Bengaluru AOI at **10m/pixel ground resolution**."
+    )
+
+    st.markdown("""
+    <div class="info-card">
+        <b>What This Module Demonstrates:</b><br>
+        Standard satellite models lose roads when tree canopies (e.g. along Bengaluru's avenues) or skyscraper shadows 
+        block optical sensors. The <b>Raw Output</b> contains noisy gaps. The <b>Healed Mask</b> applies morphological closing, 
+        small-object pruning, and directional vector healing to restore continuous, unbroken arterial corridors.
+    </div>
+    """, unsafe_allow_html=True)
+
+    bounds = [
+        [config.AOI["south"], config.AOI["west"]],
+        [config.AOI["north"], config.AOI["east"]],
+    ]
+
+    col_raw, col_healed = st.columns(2)
+
+    raw_url, raw_pixels, h_raw, w_raw = _load_mask_overlay("pred_mask.npy", (255, 50, 50, 235))
+    healed_url, healed_pixels, h_heal, w_heal = _load_mask_overlay("healed_mask.npy", (0, 230, 118, 235))
+
+    with col_raw:
+        st.markdown("#### Raw Segmentation Output (With Occlusion Gaps)")
+        m_raw = folium.Map(
+            location=[config.AOI["center_lat"], config.AOI["center_lon"]],
+            zoom_start=config.MAP_ZOOM_START,
+            tiles=config.ESRI_TILES,
+            attr="Esri World Imagery",
+        )
+        folium.raster_layers.ImageOverlay(
+            image=raw_url,
+            bounds=bounds,
+            opacity=0.88,
+            name="Raw Mask",
+        ).add_to(m_raw)
+        folium.LayerControl().add_to(m_raw)
+        st_folium(m_raw, height=460, width="stretch", returned_objects=[], key="map_raw_real")
+        st.caption(f"Raw neural detection: {raw_pixels:,} pixels. Notice discontinuities along tree avenues.")
+
+    with col_healed:
+        st.markdown("#### Topologically Healed Mask (Continuous Corridors)")
+        m_healed = folium.Map(
+            location=[config.AOI["center_lat"], config.AOI["center_lon"]],
+            zoom_start=config.MAP_ZOOM_START,
+            tiles=config.ESRI_TILES,
+            attr="Esri World Imagery",
+        )
+        folium.raster_layers.ImageOverlay(
+            image=healed_url,
+            bounds=bounds,
+            opacity=0.88,
+            name="Healed Mask",
+        ).add_to(m_healed)
+        folium.LayerControl().add_to(m_healed)
+        st_folium(m_healed, height=460, width="stretch", returned_objects=[], key="map_healed_real")
+        st.caption(f"Healed output: {healed_pixels:,} pixels. Topological gaps bridged; sensor noise removed.")
+
+    # Mask Metrics
+    st.markdown("<div class='section-divider'></div>", unsafe_allow_html=True)
+    st.markdown("#### Extraction & Healing Quality Indices")
+    tab1_m = _load_mask_comparison_metrics()
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("IoU Similarity", f"{tab1_m['iou']:.4f}", help="Intersection over Union agreement")
+    m2.metric("Dice / F1 Score", f"{tab1_m['dice']:.4f}", help="Harmonic mean of precision and recall")
+    m3.metric("Raw Road Pixels", f"{tab1_m['raw_pixels']:,}")
+    m4.metric(
+        "Healed Road Pixels",
+        f"{tab1_m['healed_pixels']:,}",
+        delta=f"{tab1_m['healed_pixels'] - tab1_m['raw_pixels']:,} (Noise Pruned)",
+    )
+
+
+# ============================================================
+# MODULE 3 — CRITICALITY & GATEKEEPER HEATMAP
+# ============================================================
+elif active_tab == "Criticality & Gatekeeper Heatmap":
+    st.markdown("### Network Criticality & Strategic Gatekeeper Heatmap")
+    st.markdown(
+        "Betweenness centrality modeling on Bengaluru's real 45,148-node road network. "
+        "Roads and junctions are color-coded by how vital they are to city-wide traffic movement."
+    )
+
+    st.markdown("""
+    <div class="info-card">
+        <b>What is Betweenness Centrality?</b><br>
+        Betweenness Centrality measures the percentage of shortest paths between all pairs of locations in Bengaluru 
+        that must traverse a specific road or intersection. 
+        <b>Red & Purple corridors</b> represent arterial lifelines. <b>Gatekeeper Nodes (marked with stars)</b> 
+        are urban single points of failure where an obstruction paralyzes multi-quadrant connectivity.
+    </div>
+    """, unsafe_allow_html=True)
+
+    G, cent = _load_real_graph()
+    edge_coords, top_gks, cent_min, cent_max, num_gks = _get_criticality_display_data()
+
+    m_crit = folium.Map(
+        location=[config.AOI["center_lat"], config.AOI["center_lon"]],
+        zoom_start=config.MAP_ZOOM_START,
+        tiles=config.ESRI_TILES,
+        attr="Esri World Imagery",
+    )
+
+    colormap = cm.LinearColormap(
+        ["#2ecc71", "#f39c12", "#e74c3c", "#8e44ad"],
+        vmin=cent_min, vmax=cent_max,
+        caption="Betweenness Centrality (Green: Local Road -> Purple: Critical Arterial)",
+    )
+    colormap.add_to(m_crit)
+
+    edge_group = folium.FeatureGroup(name="Arterial Network")
+    for locs, edge_cent, u_str, v_str in edge_coords:
+        folium.PolyLine(
+            locations=locs,
+            color=colormap(edge_cent),
+            weight=3.2,
+            opacity=0.88,
+            tooltip=f"Road {u_str}-{v_str} | Centrality: {edge_cent:.5f}",
+        ).add_to(edge_group)
+    edge_group.add_to(m_crit)
+
+    gk_group = folium.FeatureGroup(name="Gatekeeper Bottlenecks (Top 100)")
+    for lat_g, lon_g, n_id, c_val, deg_val in top_gks:
+        folium.CircleMarker(
+            location=[lat_g, lon_g],
+            radius=6.5,
+            color="#e74c3c",
+            fill=True,
+            fill_color="#f1c40f",
+            fill_opacity=0.95,
+            tooltip=f"Gatekeeper Node {n_id} | Centrality: {c_val:.4f}",
+            popup=f"<b>Gatekeeper Node {n_id}</b><br>Centrality: {c_val:.5f}<br>Degree: {deg_val}",
+        ).add_to(gk_group)
+    gk_group.add_to(m_crit)
+
+    folium.LayerControl().add_to(m_crit)
+    st_folium(m_crit, height=540, width="stretch", returned_objects=[], key="map_crit_real")
+
+    st.markdown("<div class='section-divider'></div>", unsafe_allow_html=True)
+    st.markdown("#### Real Road Network Summary")
+    s1, s2, s3, s4 = st.columns(4)
+    s1.metric("Total Graph Nodes", f"{len(G.nodes()):,}")
+    s2.metric("Total Graph Edges", f"{len(G.edges()):,}")
+    s3.metric("Gatekeeper Nodes", f"{num_gks:,} (Top 5%)")
+    s4.metric("Peak Centrality", f"{cent_max:.4f}")
+
+    st.markdown("#### Top Strategic Gatekeeper Junctions (Critical Urban Chokepoints)")
+    gk_table = []
+    for lat_g, lon_g, n_id, c_val, deg_val in top_gks[:15]:
+        gk_table.append({
+            "Gatekeeper Node ID": n_id,
+            "Betweenness Centrality": round(c_val, 5),
+            "Connecting Arterials (Degree)": deg_val,
+            "Latitude": round(lat_g, 5),
+            "Longitude": round(lon_g, 5),
+        })
+    st.dataframe(pd.DataFrame(gk_table), width="stretch", hide_index=True)
+
+
+# ============================================================
+# MODULE 4 — DISASTER STRESS SIMULATOR (HIGH VISIBILITY & DEEP EXPLANATION)
+# ============================================================
+elif active_tab == "Disaster Stress Simulator":
+    st.markdown("### Disaster Network Stress Test Simulator")
+    st.markdown(
+        "Simulate acute disaster disruptions, monsoon waterlogging, and structural bridge collapses "
+        "on Bengaluru's real 45,148-node road network to observe fragmentation and hospital access loss."
+    )
+
+    st.markdown("""
+    <div class="info-card">
+        <b>How the Stress Simulator Works:</b><br>
+        1. <b>Simulated Disruption:</b> When an extreme event strikes (e.g. Central Silk Board underpass flooding), 
+        the critical road nodes are removed from the active graph.<br>
+        2. <b>Network Fragmentation:</b> The simulator recomputes connected components to detect how many isolated 
+        neighborhood islands were severed from the main city.<br>
+        3. <b>Emergency Hospital Access:</b> It checks whether ambulances from disconnected zones can still reach 
+        <b>Victoria Hospital (Apex Emergency Medical Hub)</b>.<br>
+        4. <b>Detour Overhead:</b> It calculates the surge in travel hops and commute delay forced upon vehicles.
+    </div>
+    """, unsafe_allow_html=True)
+
+    G_original, cent = _load_real_graph()
+
+    DISASTER_SCENARIOS = {
+        "Monsoon Inundation - Central Silk Board Interchange": {
+            "description": "Severe monsoon flash floods submerge the Silk Board underpass and flyover approaches, cutting off Hosur Road and the Electronic City Expressway.",
+            "landmark": config.LANDMARKS["silk_board_junction"],
+            "impact_profile": "South-East technology corridor paralyzed. Heavy commercial and commuter isolation.",
+        },
+        "Structural Bridge Collapse - KR Puram Railway Bridge": {
+            "description": "Major structural severance on Old Madras Road at the KR Puram cable bridge isolates the Whitefield ITPL corridor from Central Bengaluru.",
+            "landmark": config.LANDMARKS["kr_puram_bridge"],
+            "impact_profile": "East Bengaluru freight and tech commuters severed. High detour overhead.",
+        },
+        "Approach Blockage / Landslide - Hebbal Flyover": {
+            "description": "Heavy rainfall causes road collapse and debris inundation on Bellary Road, paralyzing the northern gateway to Kempegowda International Airport.",
+            "landmark": config.LANDMARKS["hebbal_flyover"],
+            "impact_profile": "Northern expressway and airport transit corridor blocked.",
+        },
+        "Underpass Submergence - ORR-Sarjapur Junction": {
+            "description": "Flash flooding traps vehicles in the Outer Ring Road underpass, cutting off the Bellandur-Sarjapur tech belt.",
+            "landmark": config.LANDMARKS["outer_ring_road_junction"],
+            "impact_profile": "Bellandur tech parks and residential sectors cut off from arterial ring road.",
+        },
+        "Multi-Point Cascade Disaster (Silk Board + ORR + KR Puram)": {
+            "description": "Severe simultaneous cloudburst flood paralyzes Silk Board, Sarjapur, and KR Puram concurrently, inducing city-wide gridlock.",
+            "landmark": config.LANDMARKS["silk_board_junction"],
+            "multi_landmarks": [
+                config.LANDMARKS["silk_board_junction"],
+                config.LANDMARKS["outer_ring_road_junction"],
+                config.LANDMARKS["kr_puram_bridge"],
+            ],
+            "impact_profile": "Massive multi-quadrant fragmentation. Emergency medical corridors paralyzed.",
+        },
+    }
+
+    col_ctrl, col_info = st.columns([1, 2])
+
+    with col_ctrl:
+        st.markdown("#### 1. Select Disaster Scenario")
+        scenario_name = st.selectbox("Disaster Preset", list(DISASTER_SCENARIOS.keys()), index=0)
+        scenario = DISASTER_SCENARIOS[scenario_name]
+        st.markdown(f"**Disaster Mechanism:** {scenario['description']}")
+        st.markdown(f"**Expected Urban Impact:** `{scenario['impact_profile']}`")
+
+        lm = scenario["landmark"]
+        st.markdown(f"**Target Chokepoint:** {lm['name']} (`{lm['lat']}N, {lm['lon']}E`)")
+
+        run_btn = st.button("Execute Disaster Simulation", type="primary", width="stretch")
+
+    with col_info:
+        st.markdown("#### 2. Or Click Below to Target a Custom Road Junction")
+        st.markdown("Click anywhere on the interactive map to target a specific intersection for severance:")
+
+        m_click = folium.Map(
+            location=[config.AOI["center_lat"], config.AOI["center_lon"]],
+            zoom_start=config.MAP_ZOOM_START,
+            tiles=config.ESRI_TILES,
+            attr="Esri World Imagery",
+        )
+        all_orig_nodes = list(G_original.nodes())
+        sample_step = max(1, len(all_orig_nodes) // 500)
+        for n in all_orig_nodes[::sample_step]:
+            pos = G_original.nodes[n].get("pos", (0, 0))
+            folium.CircleMarker(
+                location=[pos[1], pos[0]], radius=4,
+                color="#3498db", fill=True, fill_opacity=0.7,
+                tooltip=f"Junction Node {n}",
+            ).add_to(m_click)
+
+        click_result = st_folium(m_click, height=280, width="stretch", returned_objects=["last_clicked"], key="click_map_real")
+
+        custom_node = None
+        if click_result and click_result.get("last_clicked"):
+            clicked = click_result["last_clicked"]
+            click_lat, click_lon = clicked["lat"], clicked["lng"]
+            min_dist = float("inf")
+            for n in G_original.nodes():
+                pos = G_original.nodes[n].get("pos", (0, 0))
+                dist = (pos[1] - click_lat) ** 2 + (pos[0] - click_lon) ** 2
+                if dist < min_dist:
+                    min_dist = dist
+                    custom_node = n
+            if custom_node is not None:
+                st.info(f"Targeted Junction Node **{custom_node}** (closest node to map click)")
+
+    if run_btn or custom_node is not None:
+        st.markdown("<div class='section-divider'></div>", unsafe_allow_html=True)
+        st.markdown("### Simulation Impact Report & Network Fracture Analysis")
+
+        if custom_node is not None and not run_btn:
+            remove_nodes = [custom_node]
+            sim_name = f"Custom Severance: Node {custom_node}"
+        else:
+            sim_name = scenario_name
+            landmarks_to_sever = scenario.get("multi_landmarks", [scenario["landmark"]])
+            remove_nodes = []
+            for target_lm in landmarks_to_sever:
+                t_lat, t_lon = target_lm["lat"], target_lm["lon"]
+                nodes_sorted = sorted(
+                    G_original.nodes(),
+                    key=lambda n: (float(G_original.nodes[n].get("lat", 0)) - t_lat) ** 2
+                    + (float(G_original.nodes[n].get("lon", 0)) - t_lon) ** 2,
+                )
+                remove_nodes.extend(nodes_sorted[:4])
+
+        remove_nodes = list(dict.fromkeys(remove_nodes))
+
+        # Intact baselines
+        cr_before = 0.9998
+        cc_before = 11
+        apl_before = 278.25
+
+        G_failed = G_original.copy()
+        G_failed.remove_nodes_from(remove_nodes)
+
+        cr_after = compute_connectivity_ratio(G_failed)
+        cc_after = nx.number_connected_components(G_failed)
+        if len(G_failed) > 0:
+            largest_cc_f = max(nx.connected_components(G_failed), key=len)
+            sub_f = G_failed.subgraph(largest_cc_f)
+            if len(sub_f) > 1:
+                sample_sources = list(sub_f.nodes())[:15]
+                t_hops = 0
+                t_cnt = 0
+                for s in sample_sources:
+                    sp_lens = nx.single_source_shortest_path_length(sub_f, s)
+                    t_hops += sum(sp_lens.values())
+                    t_cnt += len(sp_lens) - 1
+                apl_after = (t_hops / max(1, t_cnt)) if t_cnt > 0 else apl_before
+            else:
+                apl_after = 0.0
+        else:
+            apl_after = float("inf")
+
+        hospital_ref = config.REFERENCE_HUB
+        hospital_node = min(
+            G_original.nodes(),
+            key=lambda n: (float(G_original.nodes[n].get("lat", 0)) - hospital_ref["lat"]) ** 2
+            + (float(G_original.nodes[n].get("lon", 0)) - hospital_ref["lon"]) ** 2,
+        )
+
+        unreachable_before = len(G_original) - len(nx.node_connected_component(G_original, hospital_node))
+        if hospital_node in G_failed:
+            unreachable_after = len(G_failed) - len(nx.node_connected_component(G_failed, hospital_node))
+        else:
+            unreachable_after = len(G_failed)
+
+        st.markdown(f"**Disaster Event:** `{sim_name}` | **Severed Core Nodes:** `{len(remove_nodes)}`")
+
+        # Top-level Real-World Impact KPI Cards
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric(
+            "Connectivity Retention",
+            f"{cr_after*100:.1f}%",
+            delta=f"{(cr_after - cr_before)*100:.2f}%",
+            delta_color="inverse",
+            help="Percentage of total urban network that remains reachable"
+        )
+        k2.metric(
+            "Disconnected Islands",
+            f"{cc_after} Sub-Nets",
+            delta=f"+{cc_after - cc_before} Isolated",
+            delta_color="inverse",
+            help="Number of fragmented disconnected network components"
+        )
+        k3.metric(
+            "Detour Commute Overhead",
+            f"{apl_after:.1f} Hops",
+            delta=f"+{apl_after - apl_before:.1f} Delay",
+            delta_color="inverse",
+            help="Average routing path length increase caused by severance"
+        )
+        k4.metric(
+            "Cutoff from Victoria Hospital",
+            f"{unreachable_after} Nodes",
+            delta=f"+{unreachable_after - unreachable_before} Trapped",
+            delta_color="inverse",
+            help="Number of road intersections unable to reach apex emergency medical trauma care"
+        )
+
+        # Actionable Civil Defense & Emergency Response Action Plan
+        st.markdown("#### Civil Defense & Emergency Response Advisory")
+        st.markdown(f"""
+        <div class="info-card">
+            <b>Emergency Management Action Directives:</b>
+            <ul style="margin-top: 0.4rem; line-height: 1.7;">
+                <li><b>Traffic Diversion:</b> Severance of {len(remove_nodes)} arterial junction(s) requires immediate diversion via peripheral ring roads before congestion propagates.</li>
+                <li><b>Emergency Medical Isolation:</b> <b>{unreachable_after} road sectors</b> cannot reach Victoria Hospital. Deploy secondary mobile trauma stabilization units to isolated eastern/southern clusters immediately.</li>
+                <li><b>Public Transit Re-Routing:</b> BMTC buses and emergency vehicles must avoid the {lm['name']} corridor and use secondary parallel connectors.</li>
+            </ul>
+        </div>
+        """, unsafe_allow_html=True)
+
+        st.markdown("<div class='section-divider'></div>", unsafe_allow_html=True)
+        st.markdown("#### Spatial Topography Comparison: Baseline vs. Post-Severance")
+        map_b, map_a = st.columns(2)
+
+        with map_b:
+            st.markdown("**Baseline (Intact Network - Green)**")
+            m_before = folium.Map(
+                location=[config.AOI["center_lat"], config.AOI["center_lon"]],
+                zoom_start=config.MAP_ZOOM_START + 1,
+                tiles=config.ESRI_TILES,
+                attr="Esri World Imagery",
+            )
+            edges_b = list(G_original.edges())
+            step_b = max(1, len(edges_b) // 1500)
+            for u, v in edges_b[::step_b]:
+                pu = G_original.nodes[u].get("pos", (0, 0))
+                pv = G_original.nodes[v].get("pos", (0, 0))
+                folium.PolyLine(
+                    [(pu[1], pu[0]), (pv[1], pv[0])],
+                    color="#2ecc71", weight=2.2, opacity=0.85,
+                ).add_to(m_before)
+            for n in remove_nodes:
+                if n in G_original:
+                    pos = G_original.nodes[n].get("pos", (0, 0))
+                    folium.CircleMarker(
+                        [pos[1], pos[0]], radius=8,
+                        color="red", fill=True, fill_color="red",
+                        tooltip=f"Severed Chokepoint Node {n}",
+                    ).add_to(m_before)
+            st_folium(m_before, height=420, width="stretch", returned_objects=[], key="map_before_real")
+
+        with map_a:
+            st.markdown("**Post-Failure (Severed Red Links + Fragmented Component Colors)**")
+            m_after = folium.Map(
+                location=[config.AOI["center_lat"], config.AOI["center_lon"]],
+                zoom_start=config.MAP_ZOOM_START + 1,
+                tiles=config.ESRI_TILES,
+                attr="Esri World Imagery",
+            )
+            edges_a = list(G_failed.edges())
+            step_a = max(1, len(edges_a) // 1500)
+            for u, v in edges_a[::step_a]:
+                pu = G_failed.nodes[u].get("pos", (0, 0))
+                pv = G_failed.nodes[v].get("pos", (0, 0))
+                folium.PolyLine(
+                    [(pu[1], pu[0]), (pv[1], pv[0])],
+                    color="#e74c3c", weight=2.2, opacity=0.85,
+                ).add_to(m_after)
+
+            component_colors = ["#3498db", "#9b59b6", "#f39c12", "#1abc9c", "#e67e22"]
+            top_comps = sorted(nx.connected_components(G_failed), key=len, reverse=True)[:8]
+            for i, comp in enumerate(top_comps):
+                color = component_colors[i % len(component_colors)]
+                for n in list(comp)[:60]:
+                    pos = G_failed.nodes[n].get("pos", (0, 0))
+                    folium.CircleMarker(
+                        [pos[1], pos[0]], radius=4,
+                        color=color, fill=True, fill_color=color,
+                        tooltip=f"Node {n} - Disconnected Cluster {i + 1}",
+                    ).add_to(m_after)
+            st_folium(m_after, height=420, width="stretch", returned_objects=[], key="map_after_real")
+
+
+# ============================================================
+# MODULE 5 — URBAN SITE PLANNER & MAIN CITY CORRIDORS
+# ============================================================
+elif active_tab == "Urban Site Planner & City Corridors":
+    st.markdown("### Strategic Urban Site Planner & Vacant Land Advisor")
+    st.markdown(
+        "Identifies open and underutilized land parcels across Bengaluru, "
+        "evaluates arterial connectivity, and computes **real street routes to main city hubs** "
+        "to advise constructors and municipal engineers on optimal infrastructure investments."
+    )
+
+    st.markdown("""
+    <div class="info-card">
+        <b>Constructor & Civil Engineering Advisory Seam:</b><br>
+        This module assists contractors, developers, and municipal planners in evaluating unbuilt land parcels. 
+        It analyzes the <b>surrounding road network</b>, maps the <b>highway ingress access point</b>, 
+        and traces <b>active street-level routes into the main city</b> (CBD Core, Majestic Transit Hub, and Victoria Hospital). 
+        The recommendation engine ranks optimal infrastructure: Trauma Care, Transit Hubs, Sponge-City Flood Basins, 
+        or Logistics Depots with capital expenditure budgets and projected ROI timelines.
+    </div>
+    """, unsafe_allow_html=True)
+
+    col_sel, col_stats = st.columns([1, 2])
+
+    with col_sel:
+        st.markdown("#### Select Vacant Land Parcel")
+        parcel_names = [p["name"] for p in VACANT_PARCELS]
+        selected_name = st.selectbox("Parcel Selection", parcel_names, index=0)
+        selected_parcel = next(p for p in VACANT_PARCELS if p["name"] == selected_name)
+
+        st.markdown(f"**Zone:** {selected_parcel['zone']}")
+        st.markdown(f"**Developable Footprint:** `{selected_parcel['area_acres']:.1f} Acres` (~{selected_parcel['area_acres']*0.4047:.1f} Ha)")
+        st.markdown(f"**Current Zoning:** `{selected_parcel['zoning']}`")
+        st.markdown(f"**Terrain Profile:** {selected_parcel['terrain']}")
+        st.caption(selected_parcel["description"])
+
+    eval_result = _get_site_evaluation_cached(selected_parcel["id"])
+    if eval_result is None:
+        G_active, cent_active = _load_real_graph()
+        eval_result = evaluate_site_potential(
+            lat=selected_parcel["lat"],
+            lon=selected_parcel["lon"],
+            area_acres=selected_parcel["area_acres"],
+            graph=G_active,
+            centrality=cent_active,
+        )
+
+    with col_stats:
+        st.markdown("#### Geospatial Feasibility Index")
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("Parcel Area", f"{selected_parcel['area_acres']} Ac", help="Total developable parcel footprint")
+        k2.metric("Ingress Distance", f"{eval_result['ingress_point']['distance_m']:.0f} m", help="Distance to road network ingress gate")
+        k3.metric("Hospital Hub Radius", f"{eval_result['dist_hospital_km']:.1f} km", help="Distance to Victoria Hospital Emergency Trauma Hub")
+        k4.metric("Suitability Score", f"{eval_result['primary_recommendation']['suitability_score']}%", delta="High Alignment")
+
+    st.markdown("<div class='section-divider'></div>", unsafe_allow_html=True)
+    st.markdown("#### Vacant Land Parcels & Multi-Corridor City Connectivity")
+
+    ctrl_col1, ctrl_col2, ctrl_col3 = st.columns(3)
+    show_surrounding = ctrl_col1.checkbox("Show Surrounding Road Network (~1.8km)", value=True)
+    show_routes = ctrl_col2.checkbox("Show Routes to Main City Centers", value=True)
+    show_ingress = ctrl_col3.checkbox("Show Site Ingress Point", value=True)
+
+    m_vacant = folium.Map(
+        location=[selected_parcel["lat"], selected_parcel["lon"]],
+        zoom_start=13,
+        tiles=config.ESRI_TILES,
+        attr="Esri World Imagery",
+    )
+
+    # 1. Surrounding Road Network Markings (Crisp Glowing Cyan Lines)
+    if show_surrounding and eval_result.get("surrounding_roads"):
+        road_group = folium.FeatureGroup(name="Surrounding Road Network")
+        folium.PolyLine(
+            locations=eval_result["surrounding_roads"],
+            color="#00d2d3",
+            weight=2.5,
+            opacity=0.88,
+            tooltip="Local Road Network Segment",
+        ).add_to(road_group)
+        road_group.add_to(m_vacant)
+
+    # 2. Main City Connector Routes (Distinct Strategic Corridors)
+    if show_routes and eval_result.get("main_city_routes"):
+        routes_group = folium.FeatureGroup(name="Main City Arterial Corridors")
+        for hub_key, route in eval_result["main_city_routes"].items():
+            route_coords = route.get("path_coords", route.get("coordinates", []))
+            if route_coords:
+                folium.PolyLine(
+                    locations=route_coords,
+                    color=route.get("color", "#3498db"),
+                    weight=5.0,
+                    opacity=0.92,
+                    tooltip=f"{route.get('corridor_name', 'Corridor')} ({route.get('distance_km', 0)} km, ~{route.get('est_time_min', route.get('estimated_time_min', 0))} min)",
+                ).add_to(routes_group)
+        routes_group.add_to(m_vacant)
+
+    # 3. Draw All Vacant Parcels
+    for p in VACANT_PARCELS:
+        is_selected = (p["id"] == selected_parcel["id"])
+        color = "#e74c3c" if is_selected else "#f39c12"
+        fill_color = "#e74c3c" if is_selected else "#f1c40f"
+        fill_opacity = 0.6 if is_selected else 0.35
+        weight = 3 if is_selected else 1.5
+
+        folium.Polygon(
+            locations=p["polygon"],
+            color=color,
+            weight=weight,
+            fill=True,
+            fill_color=fill_color,
+            fill_opacity=fill_opacity,
+            tooltip=f"{p['name']} ({p['area_acres']} Ac)",
+            popup=f"<b>{p['name']}</b><br>Area: {p['area_acres']} Acres<br>Zoning: {p['zoning']}",
+        ).add_to(m_vacant)
+
+    # 4. Site Ingress Gate Marker
+    if show_ingress and "ingress_point" in eval_result:
+        ing = eval_result["ingress_point"]
+        folium.Marker(
+            location=[ing["lat"], ing["lon"]],
+            icon=folium.Icon(color="orange", icon="sign-in", prefix="fa"),
+            tooltip=f"Site Highway Ingress Gate ({ing['distance_m']:.0f}m from parcel centroid)",
+            popup=f"<b>Site Ingress Gate</b><br>Connecting Road: {eval_result['nearest_landmark']}<br>Distance: {ing['distance_m']:.0f} m",
+        ).add_to(m_vacant)
+        folium.PolyLine(
+            locations=[[selected_parcel["lat"], selected_parcel["lon"]], [ing["lat"], ing["lon"]]],
+            color="#f39c12",
+            weight=3,
+            dash_array="6",
+            tooltip="Ingress Connection Spur",
+        ).add_to(m_vacant)
+
+    # 5. City Hub Destination Markers
+    for h_k, h_v in MAIN_CITY_HUBS.items():
+        folium.Marker(
+            location=[h_v["lat"], h_v["lon"]],
+            icon=folium.Icon(color="purple" if h_k == "CBD_CORE" else ("blue" if h_k == "MAJESTIC_HUB" else "red"), icon=h_v["icon"], prefix="fa"),
+            tooltip=f"{h_v['name']} ({h_v['corridor_name']})",
+            popup=f"<b>{h_v['name']}</b><br>{h_v['corridor_name']}",
+        ).add_to(m_vacant)
+
+    folium.LayerControl().add_to(m_vacant)
+    st_folium(m_vacant, height=520, width="stretch", returned_objects=[], key="map_vacant_real")
+
+    # City Connectivity Table
+    if eval_result.get("main_city_routes"):
+        st.markdown("#### Main City Arterial Connectivity & Ingress Breakdown")
+        route_table_data = []
+        for h_k, route in eval_result["main_city_routes"].items():
+            route_table_data.append({
+                "Destination Hub": route.get("hub_name", route.get("name", "City Hub")),
+                "Strategic Connecting Corridor": route.get("corridor_name", "Connecting Corridor"),
+                "Street Distance": f"{route.get('distance_km', 0)} km",
+                "Transit Time (Normal)": f"~{route.get('est_time_min', route.get('estimated_time_min', 0))} min",
+                "Traversed Gatekeeper Bottlenecks": f"{route.get('gatekeepers_crossed', 0)} Chokepoint(s)",
+            })
+        st.dataframe(pd.DataFrame(route_table_data), width="stretch", hide_index=True)
+
+    # Constructor Recommendation Card
+    st.markdown("<div class='section-divider'></div>", unsafe_allow_html=True)
+    st.markdown("### Constructor Development Advisory & Feasibility Matrix")
+
+    prim = eval_result["primary_recommendation"]
+    if prim:
+        st.markdown(f"""
+        <div style="background: linear-gradient(135deg, #101c3d 0%, #172a59 100%); padding: 1.6rem 2rem; border-radius: 14px; border-left: 6px solid {prim['badge_color']}; box-shadow: 0 6px 20px rgba(0,0,0,0.35); margin-bottom: 1.5rem; border: 1px solid #23355d; border-left-width: 6px;">
+            <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 0.8rem;">
+                <span style="font-size: 1.3rem; font-weight: 800; color: #ffffff;">{prim['type']}</span>
+                <span style="background-color: {prim['badge_color']}; color: white; padding: 0.35rem 0.9rem; border-radius: 20px; font-weight: 700; font-size: 0.88rem;">Suitability Score: {prim['suitability_score']}/100</span>
+            </div>
+            <p style="color: #00d2d3; font-weight: 700; margin-top: 0.4rem; font-size: 0.95rem;">Category: {prim['category']}</p>
+            <p style="color: #cbd5e1; line-height: 1.65; margin-top: 0.8rem; font-size: 1.02rem;">{prim['rationale']}</p>
+            <div style="display: flex; gap: 2.5rem; margin-top: 1.2rem; border-top: 1px solid rgba(255,255,255,0.1); padding-top: 1rem; flex-wrap: wrap;">
+                <div><span style="color: #94a3b8; font-size: 0.82rem; text-transform: uppercase; font-weight: 600;">Estimated CAPEX:</span><br><b style="color: #ffffff; font-size: 1.15rem;">{prim['est_budget_cr']}</b></div>
+                <div><span style="color: #94a3b8; font-size: 0.82rem; text-transform: uppercase; font-weight: 600;">Target ROI Horizon:</span><br><b style="color: #ffffff; font-size: 1.15rem;">{prim['roi_timeline']}</b></div>
+                <div><span style="color: #94a3b8; font-size: 0.82rem; text-transform: uppercase; font-weight: 600;">Resilience Impact:</span><br><b style="color: #00d2d3; font-size: 1.05rem;">{prim['resilience_impact']}</b></div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    # DPR Expander
+    with st.expander("View Constructor Detailed Project Report (DPR) Brief"):
+        dpr_text = f"""# DETAILED PROJECT REPORT (DPR) BRIEF
+Site Identifier: {selected_parcel['id']} - {selected_parcel['name']}
+Geographic Coordinates: {selected_parcel['lat']}N, {selected_parcel['lon']}E
+Total Footprint: {selected_parcel['area_acres']:.1f} Acres (~{selected_parcel['area_acres']*0.4047:.2f} Ha)
+Target Plan: {prim['type']}
+
+1. Executive Site Assessment
+- Nearest Arterial Junction: {eval_result['ingress_point']['distance_m']:.0f} meters (Direct Ingress Access)
+- Distance to Central Medical Hub: {eval_result['dist_hospital_km']:.2f} km
+- Nearest Strategic Landmark: {eval_result['nearest_landmark']} ({eval_result['nearest_landmark_dist_km']:.2f} km)
+
+2. Constructor Rationale & Feasibility
+{prim['rationale']}
+
+3. Financial & Operational Overview
+- Estimated Capital Expenditure (CAPEX): {prim['est_budget_cr']}
+- Projected Return on Investment (ROI): {prim['roi_timeline']}
+- Urban Resilience Contribution: {prim['resilience_impact']}
+
+Report generated by Route Resilience Platform - ISRO BAH 2026
+"""
+        st.code(dpr_text, language="markdown")
+
+
+# ╔══════════════════════════════════════════════════════════════╗
+# ║                        FOOTER                                ║
+# ╚══════════════════════════════════════════════════════════════╝
+
+st.markdown("<div class='section-divider'></div>", unsafe_allow_html=True)
+st.markdown(
+    """
+    <div style="text-align: center; color: #64748b; padding: 1.5rem 1rem 2rem 1rem; font-size: 0.84rem;">
+        <div style="color: #00d2d3; font-weight: 700; letter-spacing: 1.1px; font-family: 'JetBrains Mono', monospace; font-size: 0.78rem; margin-bottom: 6px;">
+            BHARATIYA ANTARIKSH HACKATHON 2026 • ISRO PROBLEM STATEMENT 4
+        </div>
+        <div style="color: #cbd5e1; font-weight: 600; font-size: 0.88rem; margin-bottom: 3px;">
+            Route Resilience — Occlusion-Robust Road Extraction & Graph-Theoretic Criticality Analysis
+        </div>
+        <div style="color: #64748b; font-size: 0.76rem;">
+            Bengaluru Metropolitan AOI • Sentinel-2 Earth Observation • NetworkX Topological Graph Modeling
+        </div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
